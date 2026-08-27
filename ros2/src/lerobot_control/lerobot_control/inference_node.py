@@ -236,8 +236,28 @@ class LeRobotInferenceNode(Node):
 
     @property
     def _is_vla(self) -> bool:
-        """True if the loaded model is a VLA (pi0 / pi05 / smolvla)."""
-        return getattr(self, "model_type", None) in {"smolvla", "pi0", "pi05"}
+        """True if the policy class implements the RTC contract.
+
+        Decides sync-in-obs-timer (ACT/Diffusion/GR00T-style) vs. decoupled
+        background-thread + ActionQueue (pi0/pi05/smolvla-style) execution.
+        Resolved from the policy *class* (via lerobot's registry), not an
+        instance, since this is read before the model is loaded.
+        """
+        if not hasattr(self, "_is_vla_cache"):
+            self._is_vla_cache = self._policy_supports_rtc(getattr(self, "model_type", None))
+        return self._is_vla_cache
+
+    @staticmethod
+    def _policy_supports_rtc(model_type: str | None) -> bool:
+        if not model_type:
+            return False
+        from lerobot.policies.factory import get_policy_class
+
+        try:
+            policy_cls = get_policy_class(model_type)
+        except (NotImplementedError, ImportError):
+            return False
+        return hasattr(policy_cls, "init_rtc_processor")
 
     def _load_yaml_config(self, config_file: str) -> dict:
         """Load configuration from YAML file."""
@@ -631,7 +651,14 @@ class LeRobotInferenceNode(Node):
                 _is_new_chunk = self.use_delta_actions and _will_run_forward
 
                 if self.preprocessor:
-                    observation = self.preprocessor(dict(observation))
+                    # Inject task_description (if any) so language-conditioned
+                    # policies that don't implement RTC (e.g. GR00T) still get
+                    # their task prompt on this synchronous path — mirrors
+                    # _preprocess_vla_observation's handling on the RTC path.
+                    batch = dict(observation)
+                    if self.task_description:
+                        batch["task"] = [self.task_description]
+                    observation = self.preprocessor(batch)
                 observation = self._move_to_device(observation)
 
                 # [DEBUG] Point 1: obs.state after preprocessor (check normalization)

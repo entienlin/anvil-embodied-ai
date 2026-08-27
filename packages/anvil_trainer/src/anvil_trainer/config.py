@@ -21,6 +21,27 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+def _policy_accepts_backbone_flag(policy_type: str) -> bool:
+    """True if this policy's config has a vision_backbone field (e.g. ACT, Diffusion, VQBeT).
+
+    Policies with their own vision encoder (pi0/pi05/smolvla/groot/...) don't
+    declare this field and would reject/ignore --policy.backbone; introspecting
+    the registered config dataclass avoids hardcoding a policy-name allowlist
+    that has to be updated every time a new policy is added.
+    """
+    import dataclasses
+    import importlib
+
+    from lerobot.configs.policies import PreTrainedConfig
+
+    try:
+        importlib.import_module(f"lerobot.policies.{policy_type}.configuration_{policy_type}")
+        config_cls = PreTrainedConfig.get_choice_class(policy_type)
+    except (ModuleNotFoundError, KeyError):
+        return False
+    return any(f.name == "vision_backbone" for f in dataclasses.fields(config_cls))
+
+
 def _pop_argv(flag: str, *, remove: bool = True) -> str | None:
     """Extract --flag=VALUE from sys.argv, return VALUE or None."""
     prefix = f"--{flag}="
@@ -305,10 +326,11 @@ class TrainingConfig:
             if has_policy_path:
                 sys.argv = [a for a in sys.argv if not a.startswith("--policy.type=")]
 
-            # Inject backbone settings for non-VLA policies (ACT, Diffusion).
-            # Pi0.5 / SmolVLA use their own vision encoders and ignore these flags.
-            _VLA_POLICIES = {"pi05", "smolvla", "pi0"}
-            if policy_type not in _VLA_POLICIES and not has_policy_path:
+            # Inject backbone settings only for policies that actually have a
+            # vision_backbone config field (ACT, Diffusion, VQBeT, ...).
+            # Policies with their own vision encoder (pi0/pi05/smolvla/groot/...)
+            # ignore these flags.
+            if _policy_accepts_backbone_flag(policy_type) and not has_policy_path:
                 _BACKBONE_MAP = {
                     "resnet18": ("resnet18", "ResNet18_Weights.IMAGENET1K_V1"),
                     "resnet34": ("resnet34", "ResNet34_Weights.IMAGENET1K_V1"),

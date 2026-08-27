@@ -70,7 +70,6 @@ class EpisodeEvaluator:
         self.delta_exclude_joints = anvil_cfg.get("delta_exclude_joints", [])
         self.task_description = task_description
         self.joint_names = joint_names
-        self._is_vla = model_type in ("pi0", "pi05", "smolvla")
         self._exclude_indices: set[int] | None = None
         self._delta_ref_state: np.ndarray | None = None
         self._prev_gt_action: np.ndarray | None = None  # for delta_sequential GT computation
@@ -139,15 +138,7 @@ class EpisodeEvaluator:
 
             # Preprocess + inference
             with torch.inference_mode():
-                if self._is_vla:
-                    processed = self._preprocess_vla(obs)
-                else:
-                    if self.preprocessor:
-                        processed = self.preprocessor(dict(obs))
-                    else:
-                        processed = obs
-                    processed = self._move_to_device(processed)
-
+                processed = self._preprocess_observation(obs)
                 action_raw = self.model.select_action(processed)  # normalized tensor
 
                 # On new chunk: collect all remaining normalized queue items BEFORE postprocessing.
@@ -215,8 +206,14 @@ class EpisodeEvaluator:
             raw_ground_truth=np.stack(raw_gt_list) if raw_gt_list else None,
         )
 
-    def _preprocess_vla(self, obs: dict) -> dict:
-        """Preprocess observation for VLA models (pi0, pi05, smolvla)."""
+    def _preprocess_observation(self, obs: dict) -> dict:
+        """Preprocess an observation before inference.
+
+        Injects the task description (if any) so language-conditioned
+        policies (pi0/pi05/smolvla/groot/...) receive it; policies whose
+        preprocessor doesn't consume a "task" key simply ignore it. Falls
+        back to the raw observation if no preprocessor pipeline is loaded.
+        """
         if self.preprocessor:
             batch = dict(obs)
             if self.task_description:
