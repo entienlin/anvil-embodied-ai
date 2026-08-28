@@ -1,0 +1,88 @@
+[project]
+# NOTE: underscores, not the usual anvil-* dash convention. lerobot's
+# register_third_party_plugins() matches installed distribution names against
+# literal prefixes ("lerobot_policy_", ...) via str.startswith — confirmed by
+# testing directly: a dashed "lerobot-policy-openvla" distribution name does
+# NOT match "lerobot_policy_".startswith, so the plugin would silently never
+# be discovered. The name must be exactly this.
+name = "lerobot_policy_openvla"
+version = "0.1.0"
+description = "OpenVLA-OFT policy plugin for lerobot (out-of-tree, via register_third_party_plugins)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+authors = [
+    { name = "Anvil Robotics", email = "dev@anvil.bot" }
+]
+
+# These pins are verified working together (real openvla/openvla-7b, 7.54B
+# params, real forward pass on an RTX PRO 6000 Blackwell) — not aspirational.
+# Deliberately NOT transformers==5.3.0 (the version every other policy in this
+# repo needs): OpenVLA-OFT's parallel-decoding action head requires
+# bidirectional attention over action-chunk tokens, which only exists in
+# openvla-oft's own transformers fork — an old (~4.40, pre-dates transformers
+# masking_utils/modeling_layers/paligemma) full snapshot, not a small patch,
+# and it hard-conflicts with huggingface_hub>=1.0 at import time. This package
+# cannot share a Python environment with pi0/pi05/smolvla/groot; see
+# docker/inference-openvla/Dockerfile, which also installs three small
+# compatibility shims (transformers.masking_utils / modeling_layers /
+# models.paligemma) so lerobot 0.5.1's own PI0/PI0Fast modules — which this
+# environment never uses — don't crash the whole `lerobot.policies` package
+# import at eager-init time.
+# torch/torchvision here are the *fallback* PyPI (cu12) wheels; the Dockerfile
+# installs the +cu130 Blackwell-capable build from download.pytorch.org
+# explicitly instead (pyproject.toml has no clean per-package custom-index
+# syntax portable across pip/uv), matching the exact versions pinned below.
+dependencies = [
+    "lerobot~=0.5.1",
+    "huggingface_hub>=0.34,<1.0",
+    "transformers @ git+https://github.com/moojink/transformers-openvla-oft.git",
+    "openvla-oft @ git+https://github.com/moojink/openvla-oft.git",
+    "dlimp @ git+https://github.com/moojink/dlimp_openvla",
+    "torch==2.9.0",
+    "torchvision==0.24.0",
+    "timm==0.9.10",
+    "peft>=0.19,<0.20",
+    "diffusers==0.30.3",
+    "tensorflow==2.18.1",
+    "tensorflow_datasets>=4.9.2,<4.10",
+    "tensorflow_graphics",
+    "wandb>=0.29",
+    "einops",
+    "accelerate",
+    "draccus==0.8.0",
+    "json-numpy",
+    "jsonlines",
+    "matplotlib",
+    "sentencepiece>=0.2.0",
+    "protobuf>=6.31.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# Required because dependencies above include "pkg @ git+https://..." direct
+# references (transformers/openvla-oft/dlimp aren't on PyPI at all).
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lerobot_policy_openvla"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py"]

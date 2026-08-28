@@ -252,12 +252,47 @@ class LeRobotInferenceNode(Node):
         if not model_type:
             return False
         from lerobot.policies.factory import get_policy_class
+        from lerobot_control.model_loader import _register_third_party_policies
+
+        # This runs before ModelLoader.load(), so out-of-tree lerobot_policy_*
+        # plugins are not in the registry yet — register them here too, or a
+        # plugin policy would be misclassified as non-RTC and routed to the
+        # synchronous path.
+        _register_third_party_policies()
 
         try:
             policy_cls = get_policy_class(model_type)
         except (NotImplementedError, ImportError):
             return False
         return hasattr(policy_cls, "init_rtc_processor")
+
+    @staticmethod
+    def _policy_is_language_conditioned(model_type: str | None) -> bool:
+        """True if this policy's config has no vision_backbone field.
+
+        Same introspection anvil_trainer/config.py uses to decide whether to
+        inject --policy.backbone: policies with their own vision+language
+        encoder (pi0/pi05/smolvla/groot/...) don't declare vision_backbone,
+        while ACT/Diffusion/VQBeT-style policies do. Used here only for
+        startup logging/warnings (the task-injection itself, in
+        _preprocess_vla_observation and the sync path below, is unconditional
+        whenever task_description is set — this only controls whether we
+        surface it/warn about it in the console).
+        """
+        if not model_type:
+            return False
+        import dataclasses
+
+        from lerobot.configs.policies import PreTrainedConfig
+        from lerobot_control.model_loader import _register_third_party_policies
+
+        _register_third_party_policies()
+
+        try:
+            config_cls = PreTrainedConfig.get_choice_class(model_type)
+        except (NotImplementedError, ImportError, KeyError):
+            return False
+        return not any(f.name == "vision_backbone" for f in dataclasses.fields(config_cls))
 
     def _load_yaml_config(self, config_file: str) -> dict:
         """Load configuration from YAML file."""
@@ -399,7 +434,7 @@ class LeRobotInferenceNode(Node):
 
             self._latency_tracker = LatencyStats(maxlen=100)
 
-        if self.model_type in {"smolvla", "pi0", "pi05"} and not self.task_description:
+        if self._policy_is_language_conditioned(self.model_type) and not self.task_description:
             self.get_logger().warn(
                 f"{self.model_type} has no task_description — re-train with --task-description "
                 "or set model.task_description in the inference YAML."
@@ -419,7 +454,7 @@ class LeRobotInferenceNode(Node):
             logger.info(f"Action type: {self.action_type}")
             if self.use_delta_actions and self.delta_exclude_joints:
                 logger.info(f"Delta excl: {self.delta_exclude_joints}")
-            if self.model_type in {"smolvla", "pi0", "pi05"}:
+            if self._policy_is_language_conditioned(self.model_type):
                 logger.info(f"Task:       '{self.task_description}'")
         logger.info(f"Device:     {self.device}")
         logger.info(f"Frequency:  {self.control_freq} Hz")

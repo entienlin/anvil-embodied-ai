@@ -101,6 +101,17 @@ def train(config: TrainingConfig | None = None) -> None:
     with patched_lerobot(config):
         from lerobot.scripts.lerobot_train import train as lerobot_train
 
+        # lerobot registers out-of-tree lerobot_policy_* plugins in
+        # lerobot_train.main(), but we call train() directly — so do it here,
+        # otherwise --policy.type=<plugin> would not resolve. Best-effort: a
+        # broken or absent plugin must not block a first-party policy.
+        try:
+            from lerobot.utils.import_utils import register_third_party_plugins
+
+            register_third_party_plugins()
+        except Exception:  # noqa: BLE001 - plugin discovery is never train-critical
+            log.debug("[anvil_trainer] third-party policy plugin discovery skipped", exc_info=True)
+
         # Patch init_logging (in lerobot_train's namespace) so our resume summary
         # is emitted right after lerobot sets up its log format — and therefore
         # appears in the same format, just before the "Output dir:" line.

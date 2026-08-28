@@ -54,7 +54,25 @@ dev = [
 # =============================================================================
 smolvla = ["lerobot[smolvla]~=0.5.1"]   # SmolVLA
 pi      = ["lerobot[pi]~=0.5.1"]          # Pi0 / Pi0.5
-all     = ["lerobot[smolvla,pi]~=0.5.1"]  # all policies
+
+# GR00T (NVIDIA GR00T N1.5). NOT a plain lerobot[groot] pass-through: that
+# bracket pulls flash-attn, which is sdist-only on PyPI and needs a CUDA
+# toolkit (nvcc >= 12.8 for Blackwell/sm_120) to build. Install the prebuilt
+# wheel separately — see the GR00T layer in docker/inference/Dockerfile for
+# the pinned URL and the matching torch 2.9 pin. timm is in lerobot's bracket
+# but never imported by lerobot/policies/groot/, so it is omitted here too.
+groot   = [
+    "lerobot~=0.5.1",
+    "transformers==5.3.0",
+    "dm-tree>=0.1.8,<1.0.0",
+    "peft>=0.18.0,<1.0.0",
+    "safetensors>=0.4.3,<1.0.0",
+    "Pillow>=10.0.0,<13.0.0",
+    "einops",
+    "decord>=0.6.0,<1.0.0; platform_machine == 'x86_64'",  # GrootConfig.video_backend default
+]
+
+all     = ["lerobot[smolvla,pi]~=0.5.1"]  # all lerobot-bracket policies (GR00T: use --extra groot)
 
 [project.scripts]
 anvil-trainer = "anvil_trainer.train:main"

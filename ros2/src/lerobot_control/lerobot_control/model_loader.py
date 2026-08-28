@@ -39,6 +39,118 @@ def set_deterministic_mode(seed: int = 42):
             pass
 
 
+def _register_third_party_policies() -> None:
+    """Import installed ``lerobot_policy_*`` plugins so they self-register.
+
+    lerobot auto-discovers out-of-tree policies, but only from its own CLI
+    entrypoints (``lerobot_train.main()``, ``lerobot_record``, ...). Nothing in
+    ``lerobot.policies.factory`` or ``PreTrainedConfig`` calls it, so a plugin
+    would be invisible to ``get_policy_class`` on this path. Idempotent — the
+    plugin modules are cached after the first import.
+
+    Best-effort: a missing helper (older lerobot) or a broken plugin must not
+    stop a first-party policy from loading.
+    """
+    try:
+        from lerobot.utils.import_utils import register_third_party_plugins
+
+        register_third_party_plugins()
+    except Exception:  # noqa: BLE001 - plugin discovery is never load-critical
+        pass
+
+
+def patch_groot_for_transformers5() -> None:
+    """Make lerobot 0.5.1's GR00T loadable under its own pinned transformers 5.3.0.
+
+    GR00T vendors NVIDIA's GR00T-N1.5 model code, which was written against
+    transformers 4.x. Two things break under 5.x, both during
+    ``GR00TN15.from_pretrained``:
+
+    1. ``FlowmatchingActionHead.__init__`` constructs ``Beta(alpha, beta)``.
+       transformers 5.x initialises models on the meta device, and Beta's
+       argument validation calls ``.item()``, which meta tensors reject
+       ("Tensor.item() cannot be called on meta tensors"). Distribution
+       argument validation is a debug aid with no effect on numerics, so it is
+       disabled globally.
+    2. ``GR00TN15.__init__`` never calls ``self.post_init()``. transformers 5.x
+       populates ``all_tied_weights_keys`` there, and ``_finalize_model_loading``
+       then fails with AttributeError. Calling post_init() restores the
+       contract every PreTrainedModel subclass is expected to satisfy.
+    3. ``processor_groot.collate()`` calls the (remote-code) Eagle processor as
+       ``eagle_processor(text=..., images=..., images_kwargs={...},
+       return_tensors="pt", ...)``. ``ProcessorMixin._merge_kwargs`` in this
+       transformers version only auto-fills a modality's kwargs from a flat
+       top-level kwarg when *no* explicit dict for that modality was passed;
+       once ``images_kwargs={...}`` is given explicitly (as it is here), the
+       flat ``return_tensors="pt"`` is silently dropped for images specifically
+       (text still gets it, since no ``text_kwargs`` dict is passed). So
+       ``image_processing_eagle2_5_vl_fast.py`` takes its "no return_tensors"
+       branch and returns ``pixel_values`` as a Python list instead of a
+       stacked tensor, crashing the placeholder-substitution regex a few lines
+       later with ``AttributeError: 'list' object has no attribute 'shape'``.
+       Re-adding ``return_tensors`` directly into ``images_kwargs`` while it is
+       *also* still flat raises ``ValueError: ... passed two times`` — the
+       library's own duplicate-specification guard. The fix is to route it
+       through ``common_kwargs`` instead, which ``_merge_kwargs`` broadcasts
+       into every modality dict (including already-explicit ones) *before*
+       that guard runs — the mechanism this transformers version actually
+       intends for this case. Applied generically, on any ``__call__`` that
+       mixes a flat ``return_tensors`` with an explicit modality dict, not
+       just this one call site.
+
+    Idempotent, and a no-op if lerobot has no GR00T or has fixed this upstream.
+    Remove once lerobot ships a GR00T that is transformers-5 clean.
+    """
+    try:
+        import torch.distributions as _dist
+        from lerobot.policies.groot import groot_n1, processor_groot
+    except ImportError:
+        return
+
+    if getattr(groot_n1.GR00TN15, "_anvil_post_init_patched", False):
+        return
+
+    _dist.Distribution.set_default_validate_args(False)
+
+    _orig_init = groot_n1.GR00TN15.__init__
+
+    def _init_with_post_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        self.post_init()
+
+    groot_n1.GR00TN15.__init__ = _init_with_post_init
+    groot_n1.GR00TN15._anvil_post_init_patched = True
+
+    _orig_build_eagle_processor = processor_groot._build_eagle_processor
+
+    def _build_eagle_processor_patched(*args, **kwargs):
+        proc = _orig_build_eagle_processor(*args, **kwargs)
+        proc_cls = type(proc)
+
+        # __call__ is a dunder: Python resolves it on the type for the `proc(...)`
+        # call syntax, so an instance-attribute override would be silently
+        # ignored. Patch the class instead (idempotent — same guard as above).
+        if not getattr(proc_cls, "_anvil_return_tensors_patched", False):
+            _orig_call = proc_cls.__call__
+
+            def _call_with_return_tensors(self, *c_args, **c_kwargs):
+                has_explicit_modality_dict = any(
+                    k.endswith("_kwargs") and isinstance(v, dict) for k, v in c_kwargs.items()
+                )
+                if "return_tensors" in c_kwargs and has_explicit_modality_dict:
+                    return_tensors = c_kwargs.pop("return_tensors")
+                    common = dict(c_kwargs.get("common_kwargs") or {})
+                    common.setdefault("return_tensors", return_tensors)
+                    c_kwargs["common_kwargs"] = common
+                return _orig_call(self, *c_args, **c_kwargs)
+
+            proc_cls.__call__ = _call_with_return_tensors
+            proc_cls._anvil_return_tensors_patched = True
+        return proc
+
+    processor_groot._build_eagle_processor = _build_eagle_processor_patched
+
+
 def reset_model_state(model):
     """
     Reset model's internal state for reproducible inference.
@@ -187,6 +299,10 @@ class ModelLoader:
         try:
             from lerobot.configs.policies import PreTrainedConfig
             from lerobot.policies.factory import get_policy_class
+
+            _register_third_party_policies()
+            if self.model_type == "groot":
+                patch_groot_for_transformers5()
 
             try:
                 policy_cls = get_policy_class(self.model_type)

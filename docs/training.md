@@ -50,8 +50,96 @@ uv run anvil-trainer \
 | SmolVLA | `smolvla` | Language-conditioned VLA; requires `--extra smolvla` |
 | Pi0 | `pi0` | Flow-matching VLA; PaliGemma-3B backbone; requires `--extra pi` |
 | Pi0.5 | `pi05` | Larger Pi0 variant (~4B params); higher VRAM; requires `--extra pi` |
+| GR00T | `groot` | NVIDIA GR00T N1.5 (~3B); Eagle-2.5-VL backbone; requires `--extra groot` **and** flash-attn (see below) |
+| OpenVLA-OFT | `openvla` | Out-of-tree plugin (`lerobot_policy_openvla`); ~7.5B params; runs in a **separate** inference image — see below |
 
 Checkpoints are saved to `model_zoo/<dataset>/<job_name>/`. Run `uv run anvil-trainer --help` for the full flag reference.
+
+### GR00T: flash-attn requirement
+
+GR00T is the one policy with an install step beyond its extra. Its Eagle-2.5-VL
+backbone hard-requires flash-attn — `modeling_groot.py` prints a "fallback
+attention" message but never actually falls back, and the Eagle model asserts
+`flash_attention_2`. `--extra groot` deliberately omits flash-attn because it is
+sdist-only on PyPI and building it needs a CUDA toolkit with **nvcc >= 12.8** to
+emit `sm_120` kernels for Blackwell GPUs (an older nvcc builds without error but
+silently omits them, failing at load time with *"no kernel image is available
+for execution on the device"*).
+
+Install the official prebuilt wheel instead, which pins the torch version:
+
+```bash
+uv sync --all-packages --extra groot
+uv pip install --index-url https://download.pytorch.org/whl/cu130 \
+    torch==2.9.0 torchvision==0.24.0 torchcodec==0.9.0
+uv pip install --no-deps \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+```
+
+The inference image does this automatically when `LEROBOT_EXTRAS` contains
+`groot`; see `docker/inference/Dockerfile`. GR00T also downloads its base model
+(`nvidia/GR00T-N1.5-3B`) and tokenizer assets
+(`lerobot/eagle2hg-processor-groot-n1p5`) from the Hub on first load, so
+`HF_CACHE` must be set when running in Docker.
+
+### OpenVLA-OFT: separate environment, not an `--extra`
+
+> **Status: verified skeleton, not yet deployable.** Real weights, real
+> forward pass, real dispatch, real Docker build all verified on this
+> machine — but no rig fine-tune exists (heads are random-init), no training
+> path is implemented, and RTC support is interface-only (no real cross-chunk
+> guidance). Full checklist and path to a real deployment:
+> [`packages/lerobot_policy_openvla/README.md`](../packages/lerobot_policy_openvla/README.md#status-as-of-2026-08-28).
+
+OpenVLA-OFT (`moojink/openvla-oft`, MIT) doesn't exist in lerobot at all —
+it's an out-of-tree package, `packages/lerobot_policy_openvla/`, discovered
+via lerobot's `register_third_party_plugins()`. Unlike GR00T, it can't share
+an environment with the rest of the stack: its parallel-decoding action head
+needs bidirectional attention over action-chunk tokens, which only exists in
+openvla-oft's own transformers fork (`moojink/transformers-openvla-oft`) —
+an old, full transformers snapshot (~4.40, ~8000 commits behind upstream),
+not a small patch, and it hard-conflicts at import time with the
+`transformers==5.3.0` every other policy needs. Verified directly: real
+`openvla/openvla-7b` (7.54B params) loaded via this fork, running
+bidirectional attention on an RTX PRO 6000 Blackwell (sm_120), on
+**torch==2.9.0+cu130** — a full torch generation newer than the fork's own
+`torch==2.2.0` pin, which can't target sm_120 at all (added in PyTorch
+2.7+/CUDA 12.8, same class of issue as GR00T's flash-attn wheel).
+
+Build and run it with its own image:
+
+```bash
+docker build -f docker/inference-openvla/Dockerfile -t lerobot-inference-openvla .
+docker run --gpus all -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -v /path/to/checkpoint:/workspace/model:ro \
+    lerobot-inference-openvla
+```
+
+Sized for the OpenArm rig by default: 16-dim action/proprio (2×7 joints + 2
+grippers), vs. openvla-oft's own ALOHA default of 14 (2×6 + 2) — a real,
+supported resize (`action_dim`/`proprio_dim` in `OpenVLAConfig`), not a
+hardcoded architecture assumption. No rig-specific fine-tune exists yet, so
+`action_head`/`proprio_projector` weights are random-initialized until one is
+trained via openvla-oft's own `vla-scripts/finetune.py`
+(see `ALOHA.md` in that repo — `--use_l1_regression True --use_proprio True`).
+`use_film` (FiLM language conditioning) defaults to `False`: real FiLM
+requires a fine-tuned checkpoint's own saved vision-backbone weights, which
+don't exist for the base checkpoint.
+
+**RTC honesty note.** `OpenVLAPolicy` implements `init_rtc_processor()` /
+`predict_action_chunk()` so Phase 0's dispatch layer routes it onto the
+decoupled background-inference-thread path (avoiding blocking the 30Hz sync
+loop on ~500ms VLM latency) — a real, valuable win. It does **not** perform
+lerobot's actual RTC cross-chunk gradient-guided smoothing: that's a
+flow-matching/diffusion technique, and OFT's default L1-regression action
+head is a single deterministic MLP pass with no denoising loop to guide.
+
+**Training is not implemented.** `OpenVLAPolicy.forward()` raises
+`NotImplementedError` rather than silently computing a detached, zero-gradient
+loss — `vla.predict_action()` (the call `predict_action_chunk` uses) does its
+unnormalization in numpy internally, so building a loss on top of it can't
+backprop. A real implementation needs openvla-oft's own differentiable
+training codepath (`vla-scripts/finetune.py`), not `predict_action()`.
 
 ---
 

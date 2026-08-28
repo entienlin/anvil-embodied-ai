@@ -20,8 +20,15 @@ cp .env.example .env
 | `MODEL_PATH` | Yes (inference) | Host path to checkpoint dir. Must be absolute or start with `./` — bare relative paths are treated as Docker named volumes. |
 | `ROS_DOMAIN_ID` | Yes | ROS2 domain ID — must match the Anvil Devbox. Leave empty for localhost-only. |
 | `CYCLONEDDS_URI` | Yes | Path to CycloneDDS XML config (e.g. `configs/cyclonedds/two_pc_gpu.xml`). |
-| `LEROBOT_EXTRAS` | VLA only | Comma-separated policy extras built into the Docker image — e.g. `smolvla`, `pi,smolvla`. **Rebuild the image after changing:** `docker compose build`. ACT and Diffusion leave this empty. |
-| `HF_CACHE` | VLA only | Host path to HuggingFace model cache (default: `~/.cache/huggingface`). Required for Pi0, Pi0.5, SmolVLA — they load the PaliGemma tokenizer at runtime. |
+| `LEROBOT_EXTRAS` | VLA only | Comma-separated policy extras built into the Docker image — e.g. `smolvla`, `pi,smolvla`, `groot`. **Rebuild the image after changing:** `docker compose build`. ACT and Diffusion leave this empty. |
+| `HF_CACHE` | VLA only | Host path to HuggingFace model cache (default: `~/.cache/huggingface`). Required for Pi0, Pi0.5, SmolVLA (PaliGemma tokenizer) and GR00T (`nvidia/GR00T-N1.5-3B` + Eagle tokenizer assets), all loaded at runtime. |
+
+> **GR00T note.** `LEROBOT_EXTRAS=groot` triggers a dedicated image layer that
+> pins **torch 2.9.0+cu130** and installs a prebuilt flash-attn wheel, because
+> GR00T's Eagle-2.5-VL backbone hard-requires flash-attn and the wheel is only
+> published for torch 2.9. This pin applies *only* to images built with `groot`
+> in `LEROBOT_EXTRAS` — ACT/Diffusion/Pi0/Pi0.5/SmolVLA images are unaffected.
+> See [training.md](training.md#groot-flash-attn-requirement) for details.
 | `CONFIG_FILE` | Yes | Path to inference config YAML (default: `configs/lerobot_control/inference_default.yaml`). |
 | `ACTION_TYPE` | No | Action type passed to the **inference monitor node** (`inference_monitor_node`) only. The main inference node always reads this from `anvil_config.json` in the checkpoint via `resolve_action_type()` — this env var does **not** override it. Options: `absolute` · `delta_obs_t` · `delta_sequential`. |
 | `ECHO_TOPIC_ONLY` | No | `true` = skip model loading, subscribe topics and log FPS only. For verifying DDS connectivity without a GPU or checkpoint. Equivalent to `--echo-topic-only`. |
