@@ -82,6 +82,13 @@ The inference image does this automatically when `LEROBOT_EXTRAS` contains
 (`lerobot/eagle2hg-processor-groot-n1p5`) from the Hub on first load, so
 `HF_CACHE` must be set when running in Docker.
 
+**Also see [inference.md](inference.md)'s GR00T note**: at inference time,
+GR00T runs on the background-thread (RTC) execution path rather than the
+synchronous one every other non-VLA policy uses — its ~2-3s forward pass
+otherwise blocks the 30Hz control loop badly enough to break precise
+manipulation, measured directly on a real robot run. This doesn't affect
+training, only how the trained checkpoint is deployed.
+
 ### OpenVLA-OFT: separate environment, not an `--extra`
 
 > **Status: verified skeleton, not yet deployable.** Real weights, real

@@ -97,6 +97,24 @@ def patch_groot_for_transformers5() -> None:
        intends for this case. Applied generically, on any ``__call__`` that
        mixes a flat ``return_tensors`` with an explicit modality dict, not
        just this one call site.
+    4. ``FlowmatchingActionHead.__init__`` (the training-time action head)
+       builds ``self.beta_dist = Beta(alpha, beta)`` at construction time, same
+       as #1 — but disabling validate_args only stops the constructor from
+       *crashing*; it doesn't fix the distribution itself. ``Beta``/``Dirichlet``
+       aren't ``nn.Module``s, so their internal tensors are plain object
+       attributes, never swept up by ``model.to(device)`` or state_dict loading.
+       Built under transformers 5.x's meta-device init context, ``beta_dist``'s
+       tensors stay on ``meta`` *permanently* — inference never notices (GR00T's
+       predict_action path samples pure noise via ``torch.randn``, never uses
+       ``beta_dist``), but training's ``sample_time()`` calls
+       ``self.beta_dist.sample(...)`` for real, which meta tensors structurally
+       cannot do: ``NotImplementedError: aten::_sample_dirichlet: attempted to
+       run this operator with Meta tensors``. Fixed by lazily rebuilding
+       ``beta_dist`` the first time ``sample_time`` actually runs — by then the
+       meta-device init context has long exited, so the rebuild lands on the
+       ambient real device (confirmed: a Beta built outside that context is on
+       CPU) and samples correctly; the result is `.to(device, dtype=dtype)`d
+       right after anyway (existing code), so a CPU-built distribution is fine.
 
     Idempotent, and a no-op if lerobot has no GR00T or has fixed this upstream.
     Remove once lerobot ships a GR00T that is transformers-5 clean.
@@ -104,6 +122,9 @@ def patch_groot_for_transformers5() -> None:
     try:
         import torch.distributions as _dist
         from lerobot.policies.groot import groot_n1, processor_groot
+        from lerobot.policies.groot.action_head.flow_matching_action_head import (
+            FlowmatchingActionHead,
+        )
     except ImportError:
         return
 
@@ -149,6 +170,110 @@ def patch_groot_for_transformers5() -> None:
         return proc
 
     processor_groot._build_eagle_processor = _build_eagle_processor_patched
+
+    _orig_sample_time = FlowmatchingActionHead.sample_time
+
+    def _sample_time_with_meta_rebuild(self, batch_size, device, dtype):
+        if self.beta_dist.concentration1.is_meta:
+            from torch.distributions import Beta
+
+            self.beta_dist = Beta(self.config.noise_beta_alpha, self.config.noise_beta_beta)
+        return _orig_sample_time(self, batch_size, device, dtype)
+
+    FlowmatchingActionHead.sample_time = _sample_time_with_meta_rebuild
+
+
+def patch_groot_for_rtc_dispatch() -> None:
+    """Give GrootPolicy a "sham" RTC contract so it runs on Anvil's decoupled
+    background-inference-thread path instead of the synchronous, blocking one.
+
+    lerobot's GrootPolicy has no init_rtc_processor, so Phase 0's dispatch
+    (hasattr(policy_cls, "init_rtc_processor")) routes it onto the same
+    synchronous path as ACT/Diffusion — inference_node.py's obs-update timer
+    calls select_action() and blocks until it returns before publishing
+    anything or reading a new observation.
+
+    That's a real problem for GR00T specifically: measured directly from a
+    real robot run's monitor_output/inference_data.csv, the control loop ran
+    at a median ~7.4Hz (mean ~4.4Hz) against a 30Hz target, with stalls up to
+    3.2s. Root cause: predict_action_chunk's returned action-chunk length is
+    governed by the vendor NVIDIA checkpoint's own action_horizon (16 in the
+    cached nvidia/GR00T-N1.5-3B config) — NOT by GrootConfig.n_action_steps
+    (default 50, which the wrapper's deque(maxlen=n_action_steps) never
+    actually fills past 16 real items). 16 steps is ~0.53s of execution
+    runway at 30Hz, well under GR00T's real per-call latency (one Qwen3-1.7B+
+    SigLIP2-400M backbone pass, the dominant cost, followed by 4 cheap Euler
+    denoising steps — a single atomic, non-interruptible unit with no
+    yield/checkpoint inside the loop). So the action queue runs dry and the
+    control loop blocks waiting on inference, repeatedly, for the whole run.
+    Coarse reaching tolerates that; precise contact-critical behavior (e.g.
+    closing a gripper around a target) does not.
+
+    pi0/pi05/smolvla don't have this problem: they implement
+    init_rtc_processor and run on inference_node.py's background thread,
+    which keeps publishing from the existing action queue while a new chunk
+    computes in parallel, so slow inference never blocks control.
+
+    This patch is the same "sham RTC contract" pattern already used for
+    OpenVLA-OFT (see lerobot_policy_openvla/modeling_openvla.py, the concrete
+    reference this mirrors) — enough to satisfy the hasattr() dispatch check
+    and stop blocking the control loop, WITHOUT claiming real cross-chunk
+    gradient-guided smoothing. Unlike OpenVLA's L1-regression head (no
+    denoising loop, so real RTC guidance is structurally impossible there),
+    GR00T's FlowmatchingActionHead does have a real iterative (4-step Euler)
+    denoising loop, so genuine guidance may be implementable as a future
+    enhancement — but that means patching the loop itself to accept and blend
+    toward a guidance signal, a separate and substantially bigger piece of
+    work. This patch is deliberately scoped to just "stop blocking the
+    control loop," matching OpenVLA's honest scoping.
+
+    IMPORTANT — must be paired with RTCConfig.enabled=False for GR00T (see
+    ModelLoader._apply_rtc_config): getting GR00T onto this thread is not
+    sufficient by itself. ActionQueue.merge()'s default (enabled=True)
+    replace-mode discards `real_delay` control-loop steps from the front of
+    every new chunk, assuming real_delay < chunk_length (true for
+    pi0/pi05/smolvla). GR00T's real chunk (16 actions, ~0.53s) is far
+    shorter than its own inference latency (88-155 steps, ~3-4s), so that
+    assumption inverts and the discard empties every chunk unconditionally —
+    confirmed on real hardware as a regression from this patch alone: 6
+    successful inferences, 0 actions ever published, arms never moved.
+    RTCConfig.enabled=False (append-mode, no delay discard) is required
+    alongside this patch for GR00T to actually produce publishable actions.
+
+    Idempotent, and a no-op if lerobot has no GR00T. Remove once lerobot's
+    own GrootPolicy implements a real RTC contract upstream.
+    """
+    try:
+        from lerobot.policies.groot import modeling_groot
+    except ImportError:
+        return
+
+    if getattr(modeling_groot.GrootPolicy, "_anvil_rtc_dispatch_patched", False):
+        return
+
+    def init_rtc_processor(self) -> None:
+        """No real guidance process exists here — see
+        patch_groot_for_rtc_dispatch's docstring. This exists purely so
+        hasattr(GrootPolicy, "init_rtc_processor") is True, which is what
+        Anvil's dispatch layer (Phase 0) actually checks to route this policy
+        onto the decoupled background-inference-thread execution path."""
+        self.rtc_processor = None
+
+    modeling_groot.GrootPolicy.init_rtc_processor = init_rtc_processor
+
+    _orig_predict_action_chunk = modeling_groot.GrootPolicy.predict_action_chunk
+
+    def predict_action_chunk(self, batch, **kwargs):
+        """Accepts and discards the RTC kwargs (inference_delay,
+        prev_chunk_left_over, execution_horizon) inference_node.py's
+        background thread always passes — GrootPolicy's real
+        predict_action_chunk(self, batch) takes none of them, and would raise
+        TypeError without this wrapper (caught by the thread's own
+        try/except, silently leaving the action queue empty forever)."""
+        return _orig_predict_action_chunk(self, batch)
+
+    modeling_groot.GrootPolicy.predict_action_chunk = predict_action_chunk
+    modeling_groot.GrootPolicy._anvil_rtc_dispatch_patched = True
 
 
 def reset_model_state(model):
@@ -376,10 +501,32 @@ class ModelLoader:
         """Inject RTCConfig into RTC-capable models and call init_rtc_processor().
 
         Applies to any policy whose class implements the RTC contract
-        (currently pi0 / pi05 / smolvla in lerobot, potentially others).
-        Policies without it (e.g. ACT, Diffusion, GR00T) are skipped
-        silently. Must be called *after* _apply_config_overrides so that any
-        n_action_steps override is already in place before RTC initialisation.
+        (pi0 / pi05 / smolvla with real gradient-guided RTC, plus GR00T via
+        the "sham" contract from patch_groot_for_rtc_dispatch() purely to get
+        onto the decoupled background-thread path). Policies without it
+        (e.g. ACT, Diffusion) are skipped silently. Must be called *after*
+        _apply_config_overrides so that any n_action_steps override is
+        already in place before RTC initialisation.
+
+        `enabled` is forced False for GR00T specifically: RTCConfig.enabled=True
+        routes ActionQueue.merge() through _replace_actions_queue(), which
+        discards `real_delay` (control-loop steps elapsed during inference)
+        from the front of every new chunk — correct for pi0/pi05/smolvla,
+        whose inference is fast relative to a long chunk. GR00T inverts that:
+        its real per-call chunk length is fixed at ~16 actions
+        (action_horizon, baked into the vendor DiT checkpoint) but its real
+        inference latency (~3-4s) is 88-155 steps at 30Hz — far longer than
+        the chunk itself. So the delay clamp always reduces to
+        len(chunk)=16, slicing every chunk down to empty and leaving the
+        queue permanently at 0 (confirmed on real hardware: 6 successful
+        inferences, 0 actions ever published, arms never moved). GR00T's
+        RTCConfig.enabled=False instead routes through _append_actions_queue(),
+        which has no delay-based discarding, so chunks actually reach the
+        queue. This is safe to scope to GR00T alone: `enabled` is read only
+        by ActionQueue.merge() and by each of pi0/pi0_fast/pi05/smolvla's own
+        internal guidance-gating property — GR00T's predict_action_chunk
+        never reads rtc_config at all, and each policy gets its own RTCConfig
+        instance, so this cannot affect pi0/pi05/smolvla's real RTC guidance.
         """
         if not hasattr(model, "init_rtc_processor"):
             return
@@ -393,16 +540,18 @@ class ModelLoader:
             schedule_str = self.rtc_config_yaml.get("prefix_attention_schedule", "EXP")
             schedule = RTCAttentionSchedule[schedule_str]
 
+            rtc_enabled = self.model_type != "groot"
             model.config.rtc_config = RTCConfig(
-                enabled=True,
+                enabled=rtc_enabled,
                 execution_horizon=self.rtc_config_yaml.get("execution_horizon", 10),
                 max_guidance_weight=self.rtc_config_yaml.get("max_guidance_weight", 10.0),
                 prefix_attention_schedule=schedule,
             )
             model.init_rtc_processor()
+            mode = "replace (real RTC)" if rtc_enabled else "append (no guidance, GR00T sham RTC)"
             self._log(
                 "info",
-                f"RTC enabled for {self.model_type} "
+                f"RTC dispatch enabled for {self.model_type}, queue mode={mode} "
                 f"(execution_horizon={model.config.rtc_config.execution_horizon}, "
                 f"max_guidance_weight={model.config.rtc_config.max_guidance_weight}, "
                 f"schedule={schedule_str})",

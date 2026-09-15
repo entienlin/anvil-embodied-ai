@@ -260,6 +260,28 @@ class LeRobotInferenceNode(Node):
         # synchronous path.
         _register_third_party_policies()
 
+        # GR00T is deliberately NOT routed onto the RTC/background-thread path
+        # (patch_groot_for_rtc_dispatch() in model_loader.py exists but is not
+        # called here). Tried it: fixed the control-loop-stall problem, but
+        # real-robot testing showed severe jerky/discontinuous motion at every
+        # chunk boundary ("martial arts" — user's words). Root cause: the
+        # background thread re-triggers inference as soon as a new chunk is
+        # merged (its ~16-action chunk is always <= queue_trigger_threshold),
+        # using an observation captured from *before* that chunk executed. The
+        # robot then moves through the chunk while inference runs, so by the
+        # time the next chunk arrives ~3-4s later, it's driving from state the
+        # model never saw — producing large, independent absolute-position
+        # jumps at every boundary, rate-limited only by the position-delta
+        # safety clamp (fast enough to look violent). The sync path avoids
+        # this because the robot is frozen for the full inference duration, so
+        # the observed state never goes stale relative to the robot's actual
+        # position. Fixing this properly needs real RTC-style guidance
+        # (blending toward continuity, not just discarding the delay) or a
+        # much faster GR00T forward pass — out of scope for a quick patch.
+        # See patch_groot_for_rtc_dispatch()'s docstring in model_loader.py for
+        # the full history (stall fix attempt -> queue-empty regression fix ->
+        # this jerky-motion finding) if revisiting this.
+
         try:
             policy_cls = get_policy_class(model_type)
         except (NotImplementedError, ImportError):
@@ -386,6 +408,20 @@ class LeRobotInferenceNode(Node):
 
         if self._is_vla:
             self.rtc_config_yaml = tuning.get("rtc", {})
+            # Generic passthrough for VLA-policy-specific model config fields
+            # (e.g. inference_tuning.smolvla.num_steps to tune RTC guidance
+            # denoising iterations without retraining). Any key here is
+            # forwarded as-is to ModelLoader._apply_config_overrides, which
+            # only applies it if the loaded policy's config actually has a
+            # matching attribute (hasattr-gated there) — unknown/mistyped
+            # keys are silently ignored, same as the existing act/diffusion
+            # override behavior below. Keyed by self.model_type so this
+            # covers smolvla/pi0/pi05 uniformly without hardcoding any one
+            # policy's field names.
+            vla_tuning = tuning.get(self.model_type, {})
+            for key, value in vla_tuning.items():
+                if value is not None:
+                    config_overrides[key] = value
         elif self.model_type == "diffusion":
             diff = tuning.get("diffusion", {})
             if diff.get("n_action_steps") is not None:
@@ -512,8 +548,16 @@ class LeRobotInferenceNode(Node):
 
         if not self.echo_topic_only and self._is_vla:
             rtc = self.rtc_config_yaml
+            # Status reflects the actual ActionQueue merge mode, not just dispatch:
+            # replace-mode (real RTC guidance) needs model.config.rtc_config.enabled
+            # True; GR00T runs append-mode (enabled=False, forced in
+            # ModelLoader._apply_rtc_config) because its chunk is shorter than its
+            # own inference latency, so replace-mode's delay clamp empties every
+            # chunk. See patch_groot_for_rtc_dispatch()'s docstring in model_loader.py.
+            queue_enabled = getattr(getattr(self.model.config, "rtc_config", None), "enabled", True)
+            status = "ENABLED (replace, real RTC)" if queue_enabled else "DISPATCH ONLY (append, no guidance)"
             logger.info("┌─ RTC ───────────────────────────────────────────────────┐")
-            logger.info("│  Status:              ENABLED                           │")
+            logger.info(f"│  Status:              {status:<35}│")
             logger.info(f"│  execution_horizon  = {rtc.get('execution_horizon', 10):<4}                             │")
             logger.info(f"│  max_guidance_weight= {rtc.get('max_guidance_weight', 10.0):<6}                           │")
             logger.info(f"│  attention_schedule = {rtc.get('prefix_attention_schedule', 'EXP'):<6}                           │")
@@ -543,13 +587,44 @@ class LeRobotInferenceNode(Node):
 
         from lerobot_control.latency_stats import LatencyStats
 
+        # Generic guard, not policy-specific: the RTC/background-thread path
+        # (_preprocess_vla_observation / _inference_loop) has no delta-action
+        # restore logic at all — unlike the sync path's _obs_update, which
+        # captures _delta_ref_state and calls restore_delta_chunk on every
+        # chunk. A delta-trained policy landing here (e.g. via the
+        # patch_groot_for_rtc_dispatch "sham RTC contract" pattern, or a
+        # future third-party plugin) would silently publish un-restored delta
+        # values as if they were absolute positions. Fail loudly instead.
+        if self.use_delta_actions:
+            raise RuntimeError(
+                f"{self.model_type} is configured for delta actions "
+                f"(action_type={self.action_type!r}) but is routed onto the "
+                "RTC/background-thread inference path, which has no delta-action "
+                "restore logic (see _setup_vla_inference's comment). Publishing "
+                "would silently emit wrong absolute-position commands. This "
+                "combination isn't supported yet — retrain with absolute actions, "
+                "or add delta-restore support to the RTC path before deploying."
+            )
+
         self._action_queue = ActionQueue(self.model.config.rtc_config)
         self._latency_tracker = LatencyStats(maxlen=100)
         self._latest_obs = None
+        self._latest_obs_ts = None
         self._obs_lock = threading.Lock()
         self._inference_stop = threading.Event()
         self._rtc_threshold = self.rtc_config_yaml.get("queue_trigger_threshold", 30)
         self._rtc_delay_fallback = self.rtc_config_yaml.get("inference_delay", 4)
+
+        # TEMPORARY diagnostic instrumentation (see _log_stats_vla) — breaks the
+        # single "Infer latency" number down into where time is actually spent,
+        # to find why real per-call latency (3.5-14s) is 10-90x higher than the
+        # same model+RTC config run in isolation on the same idle GPU (150-700ms,
+        # verified directly outside this node). Remove once the gap is explained.
+        self._diag_lock_wait = LatencyStats(maxlen=100)
+        self._diag_obs_staleness = LatencyStats(maxlen=100)
+        self._diag_obs_get = LatencyStats(maxlen=100)
+        self._diag_obs_preprocess = LatencyStats(maxlen=100)
+        self._diag_merge = LatencyStats(maxlen=100)
 
     def _start_inference_thread(self) -> None:
         """Start the background RTC inference daemon thread."""
@@ -575,8 +650,14 @@ class LeRobotInferenceNode(Node):
                 continue
 
             # Read latest preprocessed observation (non-blocking)
+            _t_lock0 = time.monotonic()
             with self._obs_lock:
+                _lock_wait = time.monotonic() - _t_lock0
                 obs = self._latest_obs
+                obs_ts = self._latest_obs_ts
+            self._diag_lock_wait.add(_lock_wait)
+            if obs_ts is not None:
+                self._diag_obs_staleness.add(time.monotonic() - obs_ts)
 
             if obs is None:
                 time.sleep(0.005)
@@ -623,7 +704,9 @@ class LeRobotInferenceNode(Node):
             else:
                 processed = original
 
+            _t_merge0 = time.monotonic()
             self._action_queue.merge(original, processed, new_delay, idx_before)
+            self._diag_merge.add(time.monotonic() - _t_merge0)
             self.metrics.record_inference()
 
     def _preprocess_vla_observation(self, observation: dict) -> dict:
@@ -655,15 +738,23 @@ class LeRobotInferenceNode(Node):
         """
         if self._shutting_down:
             return
+        _t_get0 = time.monotonic()
         observation = self.strategy.get_observation(self.camera_names)
+        _t_get_elapsed = time.monotonic() - _t_get0
         if observation is None:
             return
 
         try:
             if self._is_vla:
+                if hasattr(self, "_diag_obs_get"):
+                    self._diag_obs_get.add(_t_get_elapsed)
+                _t_pre0 = time.monotonic()
                 obs = self._preprocess_vla_observation(observation)
+                if hasattr(self, "_diag_obs_preprocess"):
+                    self._diag_obs_preprocess.add(time.monotonic() - _t_pre0)
                 with self._obs_lock:
                     self._latest_obs = obs
+                    self._latest_obs_ts = time.monotonic()
             else:
                 # Keep a reference to the raw (unnormalised) observation so we can
                 # capture the joint-state baseline when a new chunk is generated.
@@ -994,6 +1085,33 @@ class LeRobotInferenceNode(Node):
             if lat_mean > 0 and hasattr(self, "_action_queue"):
                 queue_size = self._action_queue.qsize()
                 logger.info(f"  VLA queue    {queue_size}")
+
+            # TEMPORARY diagnostic — see _setup_vla_inference's comment.
+            if hasattr(self, "_diag_obs_staleness") and self._diag_obs_staleness.mean() > 0:
+                logger.info(
+                    f"  [DIAG] obs_staleness_at_read mean={self._diag_obs_staleness.mean() * 1000:.1f}ms "
+                    f"max={self._diag_obs_staleness.max() * 1000:.1f}ms"
+                )
+            if hasattr(self, "_diag_lock_wait") and self._diag_lock_wait.mean() > 0:
+                logger.info(
+                    f"  [DIAG] obs_lock_wait mean={self._diag_lock_wait.mean() * 1000:.2f}ms "
+                    f"max={self._diag_lock_wait.max() * 1000:.2f}ms"
+                )
+            if hasattr(self, "_diag_obs_get") and self._diag_obs_get.mean() > 0:
+                logger.info(
+                    f"  [DIAG] main_thread get_observation() mean={self._diag_obs_get.mean() * 1000:.1f}ms "
+                    f"max={self._diag_obs_get.max() * 1000:.1f}ms"
+                )
+            if hasattr(self, "_diag_obs_preprocess") and self._diag_obs_preprocess.mean() > 0:
+                logger.info(
+                    f"  [DIAG] main_thread preprocess() mean={self._diag_obs_preprocess.mean() * 1000:.1f}ms "
+                    f"max={self._diag_obs_preprocess.max() * 1000:.1f}ms"
+                )
+            if hasattr(self, "_diag_merge") and self._diag_merge.mean() > 0:
+                logger.info(
+                    f"  [DIAG] action_queue.merge() mean={self._diag_merge.mean() * 1000:.2f}ms "
+                    f"max={self._diag_merge.max() * 1000:.2f}ms"
+                )
 
             # Debug: Action FPS, Eff ctrl Hz, queue depth stats, smoothness
             if self._debug and lat_mean > 0:

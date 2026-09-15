@@ -47,7 +47,7 @@ services:
   mock-robot:
     <<: *base
     container_name: lerobot-fake-robot
-    profiles: [monitor, inference]
+    profiles: [monitor, inference, viz]
     command: >
       ros2 run lerobot_control mock_controller_node
         --ros-args
@@ -80,6 +80,17 @@ services:
     <<: *base
     container_name: lerobot-fake-inference
     profiles: [inference]
+    # TEMPORARY diagnostic: SYS_PTRACE lets py-spy attach to the inference
+    # process to profile the unexplained predict_action_chunk() slowdown
+    # (see docs/inference.md). Remove once that investigation concludes.
+    cap_add:
+      - SYS_PTRACE
+    # TEMPORARY diagnostic: pin to NUMA node 0's CPUs, matching GPU 0's own
+    # NUMA affinity (confirmed via `nvidia-smi topo -m`). Testing whether
+    # cross-NUMA scheduling (unpinned, this process could land on node 1's
+    # CPUs while driving a node-0 GPU) explains the unexplained 10-90x
+    # predict_action_chunk() slowdown seen only in the real running node.
+    cpuset: "0-19,40-59"
     volumes:
       # MODEL_PATH is required for --profile inference (see header comment for usage).
       # CONFIG_FILE defaults to inference_default.yaml if not set.
@@ -103,6 +114,22 @@ services:
     # MODEL_PATH is mounted at /workspace/model. HF cache structure (blobs/ + snapshots/)
     # is auto-detected by inference_node — no need for MODEL_SNAPSHOT_PATH.
     command: ros2 launch lerobot_control inference.launch.py model_path:=/workspace/model config_file:=/workspace/config.yaml debug:=${DEBUG:-false} control_frequency:=${CONTROL_FREQ:-30.0}
+
+  camera-viz:
+    <<: *base
+    container_name: lerobot-fake-camera-viz
+    profiles: [viz]
+    # x-base runs on the ros2_test bridge network, not host — unlike production's
+    # camera-viz (network_mode: host), the port needs an explicit mapping to be
+    # reachable from outside the compose network.
+    ports:
+      - "${FOXGLOVE_PORT:-8765}:8765"
+    depends_on:
+      mock-robot:
+        condition: service_healthy
+    command: >
+      ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+        port:=8765
 
 networks:
   ros2_test:

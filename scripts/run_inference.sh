@@ -9,6 +9,9 @@
 #   --fake-hardware    Use docker-compose.fake-hardware.yml (DDS bridge test, no real robot)
 #   --monitor-enable          Enable monitor profile; for production also sets MONITOR_ENABLE=true,
 #                      pre-creates MONITOR_OUTPUT_DIR as current user, and plots CSV on exit
+#   --foxglove         Enable viz profile: starts a foxglove_bridge websocket relay
+#                      so camera/joint topics can be viewed live in Foxglove Studio.
+#                      Connect to ws://<this-host-ip>:8765 (override with FOXGLOVE_PORT).
 #   --echo-topic-only  Subscribe + log FPS without loading a model (sets ECHO_TOPIC_ONLY=true);
 #                      useful to verify DDS connectivity on the GPU PC without a checkpoint
 #   --debug            Enable debug metrics: action smoothness, queue depth, Action FPS (sets DEBUG=true)
@@ -50,6 +53,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.yml"
 FAKE_HARDWARE=false
 MONITOR_REQUESTED=false
+FOXGLOVE_REQUESTED=false
 ECHO_TOPIC_ONLY_REQUESTED=false
 DEBUG_REQUESTED=false
 PASSTHROUGH=()
@@ -68,6 +72,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --monitor-enable)
             MONITOR_REQUESTED=true
+            shift
+            ;;
+        --foxglove)
+            FOXGLOVE_REQUESTED=true
             shift
             ;;
         --echo-topic-only)
@@ -97,6 +105,12 @@ done
 # Always inject --profile monitor when requested
 if [[ "$MONITOR_REQUESTED" == true ]]; then
     PASSTHROUGH=("--profile" "monitor" "${PASSTHROUGH[@]}")
+fi
+
+# Always inject --profile viz when requested (foxglove_bridge)
+if [[ "$FOXGLOVE_REQUESTED" == true ]]; then
+    PASSTHROUGH=("--profile" "viz" "${PASSTHROUGH[@]}")
+    echo "[run_inference] Foxglove bridge enabled → connect to ws://<this-host-ip>:${FOXGLOVE_PORT:-8765}"
 fi
 
 # ECHO_TOPIC_ONLY: subscribe + log FPS without loading a model (DDS connectivity check)

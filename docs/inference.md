@@ -29,6 +29,38 @@ cp .env.example .env
 > published for torch 2.9. This pin applies *only* to images built with `groot`
 > in `LEROBOT_EXTRAS` — ACT/Diffusion/Pi0/Pi0.5/SmolVLA images are unaffected.
 > See [training.md](training.md#groot-flash-attn-requirement) for details.
+
+> **GR00T runs on the synchronous inference path (like ACT/Diffusion), not
+> the background-thread (RTC) path.** This was tried and reverted. Moving
+> GR00T onto the decoupled thread (a "sham" RTC contract, since it has no
+> real gradient-guided smoothing) did fix a real problem — measured directly
+> from a real robot run, the synchronous path's control loop ran at a median
+> ~7.4Hz with stalls up to 3.2s, because GR00T's real per-inference
+> action-chunk length (~16 steps, governed by the checkpoint's own
+> `action_horizon`, not `GrootConfig.n_action_steps`) gives far less
+> execution runway (~0.53s) than its own inference latency (~3-4s) needs.
+> But real-robot testing of the decoupled-thread version surfaced a worse
+> problem: severe jerky, discontinuous motion at every chunk boundary. Root
+> cause: the background thread re-triggers a new inference as soon as a
+> chunk is merged (GR00T's ~16-action chunk is always under the trigger
+> threshold), using an observation captured from *before* that chunk even
+> started executing. The robot then moves through the chunk while inference
+> runs in parallel, so by the time the next chunk arrives ~3-4s later, it's
+> driving from a robot state the model never actually saw — producing large,
+> independent absolute-position jumps at every chunk boundary, rate-limited
+> only by the position-delta safety clamp (fast enough to look violent). The
+> synchronous path avoids this because the robot is frozen for the entire
+> inference duration, so the observed state can never go stale relative to
+> the robot's actual position — the tradeoff is the 7.4Hz stalling above.
+> Actually fixing this would need real RTC-style guidance (blending toward
+> continuity across chunks, not just a queue trick) or a much faster GR00T
+> forward pass (fewer denoising steps, quantization, compiled backbone) —
+> both out of scope for now. `patch_groot_for_rtc_dispatch()` in
+> `model_loader.py` still exists (unused, not called) with the full history
+> of both attempts in its docstring, in case this is revisited. GR00T also
+> currently requires absolute actions — see `_setup_vla_inference`'s guard in
+> `inference_node.py` for why delta actions aren't supported on the RTC path.
+
 | `CONFIG_FILE` | Yes | Path to inference config YAML (default: `configs/lerobot_control/inference_default.yaml`). |
 | `ACTION_TYPE` | No | Action type passed to the **inference monitor node** (`inference_monitor_node`) only. The main inference node always reads this from `anvil_config.json` in the checkpoint via `resolve_action_type()` — this env var does **not** override it. Options: `absolute` · `delta_obs_t` · `delta_sequential`. |
 | `ECHO_TOPIC_ONLY` | No | `true` = skip model loading, subscribe topics and log FPS only. For verifying DDS connectivity without a GPU or checkpoint. Equivalent to `--echo-topic-only`. |

@@ -74,6 +74,18 @@ def parse_args() -> argparse.Namespace:
         help="Device to run inference on (cuda or cpu, default: cuda)",
     )
     parser.add_argument(
+        "--video-backend",
+        type=str,
+        default=None,
+        choices=["torchcodec", "pyav", "video_reader"],
+        help=(
+            "Video decoding backend (default: lerobot's own auto-detect, "
+            "usually torchcodec). Use 'pyav' if torchcodec's native library "
+            "fails to load — see docs/training.md's --dataset.video_backend note "
+            "for why that can happen after installing a non-default torch build."
+        ),
+    )
+    parser.add_argument(
         "--task-description",
         type=str,
         help="Task prompt for VLA models (overrides anvil_config.json)",
@@ -120,7 +132,7 @@ def main() -> None:
 
     # 3. Initialize Dataset and Split info
     try:
-        eval_dataset = EvaluationDataset(dataset_path)
+        eval_dataset = EvaluationDataset(dataset_path, video_backend=args.video_backend)
         split_info = eval_dataset.resolve_splits(anvil_cfg, checkpoint_path=checkpoint_path)
         log.info("[anvil-eval] Dataset: %s (%d episodes)", dataset_path.name, eval_dataset.total_episodes)
     except Exception as e:

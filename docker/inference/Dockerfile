@@ -8,12 +8,16 @@ ARG LEROBOT_EXTRAS=""
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies
+# ros-jazzy-foxglove-bridge: lightweight websocket relay so camera/joint topics
+# can be viewed live in Foxglove Studio from any machine — no X11/GUI needed on
+# this box. Small package, always installed rather than gated behind a build arg.
 RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-venv \
     git \
     curl \
     ros-jazzy-rmw-cyclonedds-cpp \
+    ros-jazzy-foxglove-bridge \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for Python package management

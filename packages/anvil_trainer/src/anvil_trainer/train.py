@@ -46,6 +46,26 @@ from anvil_trainer.transforms import (  # noqa: E402, F401
 log = logging.getLogger(__name__)
 
 
+def _ensure_model_loader_importable() -> None:
+    """Add lerobot_control to sys.path for ModelLoader import (zero ROS2 deps).
+
+    Same mechanism as anvil_eval.evaluator._ensure_model_loader_importable —
+    lerobot_control is a plain-Python module inside the ROS2 package tree with
+    no actual ROS2 dependency, so it's importable standalone once its
+    directory is on sys.path.
+    """
+    env_path = os.environ.get("LEROBOT_CONTROL_PATH")
+    if env_path:
+        target = str(Path(env_path))
+    else:
+        # Repo-relative: packages/anvil_trainer/src/anvil_trainer/train.py -> repo root
+        repo_root = Path(__file__).resolve().parents[4]
+        target = str(repo_root / "ros2" / "src" / "lerobot_control")
+
+    if target not in sys.path:
+        sys.path.insert(0, target)
+
+
 # =============================================================================
 # Note resolution helper
 # =============================================================================
@@ -111,6 +131,24 @@ def train(config: TrainingConfig | None = None) -> None:
             register_third_party_plugins()
         except Exception:  # noqa: BLE001 - plugin discovery is never train-critical
             log.debug("[anvil_trainer] third-party policy plugin discovery skipped", exc_info=True)
+
+        # GR00T under lerobot 0.5.1 + transformers 5.3.0 needs the same
+        # compatibility patches as inference (see
+        # lerobot_control.model_loader.patch_groot_for_transformers5 for the
+        # full explanation — meta-tensor Beta distribution init,
+        # GR00TN15.__init__ never calling post_init(), Eagle processor
+        # return_tensors handling). That patch is applied inside
+        # ModelLoader.load() for inference, but training builds the policy via
+        # lerobot_train -> make_policy -> GrootPolicy(config) directly, which
+        # never goes through ModelLoader — so it has to be applied here too.
+        if any(a.startswith("--policy.type=groot") for a in sys.argv):
+            try:
+                _ensure_model_loader_importable()
+                from lerobot_control.model_loader import patch_groot_for_transformers5
+
+                patch_groot_for_transformers5()
+            except Exception:  # noqa: BLE001 - fall through to lerobot's own error if this fails
+                log.debug("[anvil_trainer] groot transformers5 compat patch skipped", exc_info=True)
 
         # Patch init_logging (in lerobot_train's namespace) so our resume summary
         # is emitted right after lerobot sets up its log format — and therefore

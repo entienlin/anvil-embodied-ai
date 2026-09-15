@@ -11,6 +11,18 @@ services:
     network_mode: host
     ipc: host
     privileged: true
+    # Pinned to NUMA node 0's CPUs, matching GPU 0's own NUMA affinity
+    # (confirmed via `nvidia-smi topo -m`: GPU0/1 -> node 0, GPU2/3 -> node 1).
+    # Without this, the container's threads are free to run on either
+    # socket's CPUs while driving GPU 0 — measured directly to roughly
+    # double predict_action_chunk() latency when that happens (real-robot
+    # VLA inference: ~16-25s unpinned vs ~8-10s pinned, on an otherwise
+    # identical run). Still not a full explanation of that latency (an
+    # isolated, single-process call of the same model/config takes
+    # ~0.3-0.4s), but a real, low-risk improvement. If INFERENCE_GPU_ID is
+    # ever changed to 2 or 3 (node 1), update this range to "20-39,60-79"
+    # to match.
+    cpuset: "0-19,40-59"
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-}
       - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
@@ -19,6 +31,20 @@ services:
       - DEBUG=${DEBUG:-false}
       - MONITOR_ENABLE=${MONITOR_ENABLE:-false}
       - DISPLAY=${DISPLAY}
+      # PyTorch defaults each process's intra-op thread pool to ~half the host's
+      # cores (confirmed: 40 threads on this 80-core shared machine) — applies
+      # independently to the main inference process AND each of the 4 image
+      # worker subprocesses, since they're separate Python processes that each
+      # import torch fresh. Uncapped, that's up to 200 threads contending for
+      # 80 physical cores even before counting other users' jobs on this shared
+      # box — a real, measured cause of severe CPU scheduling contention that
+      # was inflating predict_action_chunk() latency 5-15x over the same call
+      # measured in isolation. These env vars are inherited by every child
+      # process, capping each one uniformly. Tune INFERENCE_TORCH_THREADS in
+      # .env if 4 turns out to be too low/high for a given model.
+      - OMP_NUM_THREADS=${INFERENCE_TORCH_THREADS:-4}
+      - MKL_NUM_THREADS=${INFERENCE_TORCH_THREADS:-4}
+      - NUMEXPR_NUM_THREADS=${INFERENCE_TORCH_THREADS:-4}
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # Both MODEL_PATH and CONFIG_FILE are host paths — tab-completion works naturally.
@@ -34,8 +60,15 @@ services:
       resources:
         reservations:
           devices:
+            # Pinned to a specific GPU (default 0) rather than count: all —
+            # this is a shared machine; count: all exposed every GPU to the
+            # container (PyTorch then defaults to cuda:0, whichever physical
+            # card that happens to be), which risked landing on a GPU another
+            # user's job was actively saturating. Override per-run with
+            # INFERENCE_GPU_ID=<idle index> in .env if GPU 0 is ever busy —
+            # check `nvidia-smi` first.
             - driver: nvidia
-              count: all
+              device_ids: ["${INFERENCE_GPU_ID:-0}"]
               capabilities: [gpu]
     command: ros2 launch lerobot_control inference.launch.py model_path:=/workspace/model config_file:=/workspace/config.yaml echo_topic_only:=${ECHO_TOPIC_ONLY:-false} debug:=${DEBUG:-false} monitor_enable:=${MONITOR_ENABLE:-false} control_frequency:=${CONTROL_FREQ:-30.0}
 
@@ -60,3 +93,25 @@ services:
         --ros-args
         -p output_dir:=/workspace/monitor_output
         -p action_type:=${ACTION_TYPE:-absolute}
+
+  camera-viz:
+    image: ghcr.io/anvil-robotics/lerobot-inference:${IMAGE_TAG:-latest}
+    container_name: lerobot-camera-viz
+    network_mode: host
+    ipc: host
+    profiles:
+      - viz
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-}
+      - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      - CYCLONEDDS_URI=${CYCLONEDDS_URI:-file:///workspace/configs/cyclonedds/single_pc.xml}
+    # Relays whatever's on the DDS domain (camera + joint topics) to a websocket
+    # for Foxglove Studio (app.foxglove.dev or desktop) — connect to
+    # ws://<this-host-ip>:8765. Doesn't depend on the inference service: camera
+    # topics come from the robot PC's own driver stack, so this works whether or
+    # not inference is running here, and inference reading the same topics
+    # doesn't block or steal frames from it (plain DDS pub/sub, multiple
+    # subscribers are fine).
+    command: >
+      ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+        port:=${FOXGLOVE_PORT:-8765}

@@ -13,7 +13,7 @@
 model:
   # VLA task prompt — required for SmolVLA / Pi0 / Pi0.5, ignored for ACT / Diffusion
   # Set to the task the model was trained/finetuned for.
-  task_description: null
+  task_description: "Pick up the white bottle and lift the trash can lid off the trash can. Then place the white bottle in the trash can and put the lid back down."
 
 # -----------------------------------------------------------------------------
 # Inference Tuning (per model type)
@@ -27,7 +27,15 @@ inference_tuning:
   act:
     # n_action_steps: steps to execute before re-running inference.
     #   Tuning: jittery → raise; hesitates → lower; GPU slow → lower
-    n_action_steps: null
+    #   Set to 80 (matching the working 50ep baseline's trained value) to test
+    #   against the act_100ep checkpoint, which was accidentally trained with
+    #   60 instead of 80 — a real config mismatch, not intentional. The 100ep
+    #   real-robot test showed heavy oscillation (path length ~30x net
+    #   displacement per joint from monitor_output/inference_data.csv), and
+    #   lower n_action_steps means more frequent re-planning/chunk-boundary
+    #   transitions, which is one plausible contributor. This is a pure
+    #   inference-time override — safe to try without retraining.
+    n_action_steps: 80
     # temporal_ensemble_coeff: re-infers every step, exponentially weights
     #   overlapping predictions. Use 0.01 (paper default). Forces n_action_steps=1.
     temporal_ensemble_coeff: null
@@ -39,7 +47,40 @@ inference_tuning:
     #   Default (null) = num_train_timesteps (100). Set 10 for real-time (78ms vs 711ms).
     num_inference_steps: 10
 
-  # RTC — VLA models only (pi0, pi0.5, smolvla), always enabled
+  # SmolVLA — flow-matching action head with RTC guidance. Model-specific
+  # fields here are forwarded generically (see _setup_model in
+  # inference_node.py) to the loaded SmolVLAConfig if it has a matching
+  # attribute; unknown keys are silently ignored.
+  smolvla:
+    # num_steps: Euler denoising iterations per inference call (flow matching).
+    #   Pure inference-time hyperparameter — NOT baked into trained weights,
+    #   safe to lower without retraining (same tradeoff as Diffusion's
+    #   num_inference_steps above). Default (null) = training-time value (10).
+    #   Real RTC guidance runs torch.enable_grad() + a backward pass per step,
+    #   so this is markedly more expensive than plain forward-only denoising —
+    #   on this rig, measured real per-call latency (mean ~1-3.4s, p95 ~8s)
+    #   frequently exceeds chunk_size's execution budget (50 actions / 30Hz ≈
+    #   1.67s), which triggers the same real_delay-exceeds-chunk-length
+    #   clamp-to-empty behavior documented below for GR00T — except here it's
+    #   probabilistic rather than certain, causing intermittent multi-second
+    #   stalls instead of a permanent freeze. Lowering num_steps (e.g. 5) cuts
+    #   per-call latency roughly in proportion to the step count, pushing more
+    #   calls under that threshold. Try lowering gradually and watch for
+    #   degraded action smoothness/precision before committing to a value.
+    num_steps: 5
+
+  # RTC — background-thread inference path. Real RTC guidance applies to
+  # pi0/pi0.5/smolvla only. GR00T does NOT use this section — it runs on the
+  # synchronous path (like ACT/Diffusion) instead. A "sham" RTC contract for
+  # GR00T (patch_groot_for_rtc_dispatch() in model_loader.py, present but not
+  # called) was tried and reverted: it fixed the synchronous path's
+  # control-loop stalling (GR00T's ~16-action chunk gives only ~0.53s of
+  # execution runway against its own ~3-4s inference latency), but real-robot
+  # testing showed severe jerky motion at every chunk boundary — the
+  # background thread re-triggers inference using a pre-chunk observation, so
+  # each new chunk drives from robot state the model never saw. See the "GR00T
+  # runs on the synchronous inference path" note in docs/inference.md for the
+  # full history if revisiting this.
   #   Background thread runs inference continuously; control loop reads from ActionQueue.
   rtc:
     # inference_delay: fallback step-count for first inference before LatencyTracker kicks in.
@@ -47,7 +88,20 @@ inference_tuning:
     inference_delay: 10
     # queue_trigger_threshold: re-trigger inference when queue depth ≤ this.
     #   Set equal to chunk_size for maximum RTC overlap.
-    queue_trigger_threshold: 50
+    #   Raised from 50 → 300 after the first real pi0.5 test (chunk_size=400):
+    #   at 50, the background thread only got a 1.67s head start (50/30Hz)
+    #   before the queue could hit empty, but pi0.5's real per-call latency
+    #   measures mean~6s / p95~9.3s on this rig — nowhere near enough lead
+    #   time. Confirmed on real hardware: `VLA queue` repeatedly hit 0
+    #   (Action FPS collapsing to ~7-17Hz in those windows), which is exactly
+    #   the "motion isn't continuous" symptom. 300/30Hz ≈ 10s of head start
+    #   comfortably covers the observed p95. Shared with SmolVLA (chunk=300);
+    #   harmless there too — its own real_delay (85-155) is well under 300, so
+    #   this just makes its background thread re-trigger immediately after
+    #   every merge (continuous overlap) rather than waiting, which trades a
+    #   bit of extra GPU compute for a bigger safety margin, not a behavior
+    #   regression.
+    queue_trigger_threshold: 300
     # execution_horizon: steps used from each chunk before re-inferring.
     #   Higher → less frequent inference, slower reaction. Lower → faster reaction.
     execution_horizon: 12
