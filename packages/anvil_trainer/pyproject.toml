@@ -54,6 +54,7 @@ dev = [
 # =============================================================================
 smolvla = ["lerobot[smolvla]~=0.5.1"]   # SmolVLA
 pi      = ["lerobot[pi]~=0.5.1"]          # Pi0 / Pi0.5
+hilserl = ["lerobot[hilserl]~=0.5.1"]   # HIL-SERL (SAC, gym_manipulator, actor/learner over gRPC)
 
 # GR00T (NVIDIA GR00T N1.5). NOT a plain lerobot[groot] pass-through: that
 # bracket pulls flash-attn, which is sdist-only on PyPI and needs a CUDA
