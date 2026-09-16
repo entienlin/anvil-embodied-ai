@@ -44,7 +44,7 @@ This repository is the embodied AI stack for the Anvil platform — data convers
 |-------|-------------|
 | **0. Data Collection** | Record teleoperation demos as MCAP files via [Anvil Devbox](https://shop.anvil.bot/products/anvil-devbox) |
 | **1. Data Conversion** | Convert MCAP recordings to LeRobot v3.0 datasets → [docs/data-conversion.md](docs/data-conversion.md) (browse results with [dataset-viz](docs/dataset-viz.md)) |
-| **2. Model Training** | Train ACT, Diffusion, SmolVLA, Pi0, or Pi0.5 policies → [docs/training.md](docs/training.md) |
+| **2. Model Training** | Train ACT, Diffusion, SmolVLA, Pi0, Pi0.5, or GR00T policies → [docs/training.md](docs/training.md) |
 | **3. Offline Evaluation** | Validate model performance against ground-truth before deploying → [docs/evaluation.md](docs/evaluation.md) |
 | **4. Run Inference** | Deploy trained models on a GPU PC via ROS2 CycloneDDS → [docs/inference.md](docs/inference.md) |
 
@@ -85,6 +85,7 @@ ACT and Diffusion are included in the base install. For other policies:
 |-------|--------|
 | `smolvla` | SmolVLA |
 | `pi` | Pi0 / Pi0.5 |
+| `groot` | GR00T N1.5 — also needs a flash-attn wheel install, see [docs/training.md](docs/training.md#groot-flash-attn-requirement) |
 
 ```bash
 uv sync --all-packages --extra smolvla
@@ -112,7 +113,7 @@ After conversion, browse episodes, videos, and action curves with `dataset-viz`'
 
 ### 2. Model Training ([doc](docs/training.md))
 
-Train ACT, Diffusion, SmolVLA, Pi0, or Pi0.5 policies. Checkpoints saved to `model_zoo/<dataset>/<job_name>/`.
+Train ACT, Diffusion, SmolVLA, Pi0, Pi0.5, or GR00T policies. Checkpoints saved to `model_zoo/<dataset>/<job_name>/`.
 
 ### 3. Offline Evaluation ([doc](docs/evaluation.md))
 

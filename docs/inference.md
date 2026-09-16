@@ -66,6 +66,9 @@ cp .env.example .env
 | `ECHO_TOPIC_ONLY` | No | `true` = skip model loading, subscribe topics and log FPS only. For verifying DDS connectivity without a GPU or checkpoint. Equivalent to `--echo-topic-only`. |
 | `MONITOR_ENABLE` | No | `true` = enable the inference monitor node (records per-step CSV + PNG report). Equivalent to `--monitor-enable`, but without the auto-plot on exit and output dir pre-creation that the flag provides. |
 | `DEBUG` | No | `true` = enable extra metrics: action smoothness, queue depth stats, Action FPS. |
+| `FOXGLOVE_PORT` | No | Websocket port for the `--foxglove` camera-viz service (default `8765`). |
+| `INFERENCE_GPU_ID` | No | GPU index the inference container uses (default `0`). Override if that GPU is busy on a shared machine. |
+| `INFERENCE_TORCH_THREADS` | No | Caps OMP/MKL/NUMEXPR thread pools inside the container (default `4`) — see the `cpuset`/thread-capping comments in `docker-compose.yml` for why this matters on a shared multi-core machine. |
 
 For full descriptions and defaults, see [`.env.example`](../.env.example).
 
@@ -81,6 +84,7 @@ The script flags are a lightweight way to override behaviour at the command line
 |------|-------------|
 | `--fake-hardware` | Switches to `docker-compose.fake-hardware.yml` — simulates a 2-PC setup locally over a bridge network (CycloneDDS, no real robot). |
 | `--monitor-enable` | Adds `--profile monitor` to the compose command. In production (non-fake-hardware) mode also exports `MONITOR_ENABLE=true`, pre-creates the output dir as the current user, and auto-plots the CSV on exit. |
+| `--foxglove` | Adds `--profile viz` to the compose command — starts a `foxglove_bridge` websocket relay so camera feeds and joint/command topics can be viewed live during inference. See [Live Camera Viz](#live-camera-viz-foxglove) below. |
 | `--echo-topic-only` | Exports `ECHO_TOPIC_ONLY=true` — subscribes to topics and logs FPS without loading a model or GPU. Equivalent to setting `ECHO_TOPIC_ONLY=true` in `.env`. |
 | `--debug` | Exports `DEBUG=true` — enables extra metrics: action smoothness, queue depth stats, Action FPS. Equivalent to setting `DEBUG=true` in `.env`. |
 
@@ -155,13 +159,33 @@ inference_tuning:
     # null = num_train_timesteps (100 steps, ~300ms on GPU).
     # 10   = ~30ms on GPU — recommended for real-time deployment.
 
+  smolvla:
+    # Model-specific fields here are forwarded generically to the loaded
+    # policy config if it has a matching attribute — same mechanism covers
+    # Pi0/Pi0.5 under their own `pi0:`/`pi05:` keys if needed.
+    num_steps: null
+    # Euler denoising iterations per inference call (flow matching).
+    # null = training-time value (10). Pure inference-time hyperparameter —
+    # safe to lower without retraining, same tradeoff as Diffusion's
+    # num_inference_steps above. Real RTC guidance runs a backward pass per
+    # step, so this is markedly more expensive than plain forward denoising —
+    # lowering it (e.g. 5) cuts per-call latency roughly proportionally if
+    # real latency is cutting into your chunk_size's execution budget.
+
   rtc:
     # VLA models only (SmolVLA / Pi0 / Pi0.5)
     inference_delay: 10
     # Fallback step-count before LatencyTracker auto-calibrates.
     # Rule of thumb: ceil(first_inference_ms × control_freq / 1000)
-    queue_trigger_threshold: 50
-    # Re-trigger inference when ActionQueue depth ≤ this.
+    queue_trigger_threshold: 300
+    # Re-trigger inference when ActionQueue depth ≤ this. Needs to leave
+    # enough head start (threshold / control_freq seconds) to cover your
+    # model's real per-call inference latency, independent of chunk_size —
+    # too low a threshold starves the queue and shows up as stuttering
+    # motion even when chunk_size itself is generously sized. 300 here
+    # reflects a much larger/slower model (pi0.5, chunk_size=400); a small
+    # fast model like SmolVLA doesn't need it this high, but a larger shared
+    # value is harmless (just means more continuous background inference).
     execution_horizon: 12
     # Steps consumed per chunk before the next inference fires.
     max_guidance_weight: 10.0
@@ -178,6 +202,44 @@ inference_tuning:
 #   # Holds the last command until threshold is crossed — useful for
 #   # overcoming motor dead zones / friction. Default: disabled (null).
 ```
+
+## Live Camera Viz (Foxglove)
+
+To watch camera feeds and joint/command topics live while inference is
+running — useful for visually diagnosing what a policy is looking at when it
+misbehaves — add `--foxglove`:
+
+```bash
+COMPOSE_MENU=false ./scripts/run_inference.sh --monitor-enable --foxglove up --build
+```
+
+This starts a `foxglove_bridge` container that relays whatever's on the DDS
+domain (all four camera topics, `/joint_states`, and the command topics) to a
+websocket, independent of the inference container — it's a second subscriber
+on the same DDS bus, not something the inference pipeline routes through, so
+it works whether or not inference happens to be running, and doesn't block or
+steal frames from it.
+
+Connect from **Foxglove Studio** (app.foxglove.dev, or the desktop app) to
+`ws://<this-host-ip>:8765` (override the port with `FOXGLOVE_PORT` in
+`.env`). Add an "Image" panel per camera topic to watch all four feeds side
+by side.
+
+> **Bandwidth caution:** `foxglove_bridge` relays full-resolution camera
+> streams, which adds real CPU/network load on top of whatever the inference
+> container's own image workers are already consuming. On this project,
+> running `--foxglove` during a real-robot test measurably worsened an
+> already-chronic camera FPS bottleneck (from ~14-20Hz down to ~4-10Hz),
+> which is enough to visibly slow down a synchronous-path policy like ACT
+> (whose control loop runs at the same rate as incoming camera frames).
+> Prefer using `--foxglove` for one-off visual debugging sessions rather than
+> leaving it on during performance-sensitive real-robot tests.
+
+The `--fake-hardware` compose file also supports `--foxglove` (using mock
+camera data from `mock_controller_node`) if you want to verify the viz
+pipeline itself without a real robot — in that mode the port is explicitly
+mapped (`ports:` in `docker-compose.fake-hardware.yml`) since the fake-hardware
+stack runs on a bridge network rather than the host network production uses.
 
 ## DDS Middleware Selection
 

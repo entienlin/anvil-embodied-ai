@@ -83,11 +83,12 @@ The inference image does this automatically when `LEROBOT_EXTRAS` contains
 `HF_CACHE` must be set when running in Docker.
 
 **Also see [inference.md](inference.md)'s GR00T note**: at inference time,
-GR00T runs on the background-thread (RTC) execution path rather than the
-synchronous one every other non-VLA policy uses — its ~2-3s forward pass
-otherwise blocks the 30Hz control loop badly enough to break precise
-manipulation, measured directly on a real robot run. This doesn't affect
-training, only how the trained checkpoint is deployed.
+GR00T runs on the **synchronous** execution path, same as ACT/Diffusion —
+moving it onto the background-thread (RTC) path was tried and reverted after
+real-robot testing showed severe jerky motion at every chunk boundary (worse
+than the synchronous path's own control-loop stalling problem it was meant to
+fix). This doesn't affect training, only how the trained checkpoint is
+deployed — see inference.md for the full history if revisiting this.
 
 ### OpenVLA-OFT: separate environment, not an `--extra`
 
@@ -155,6 +156,7 @@ training codepath (`vla-scripts/finetune.py`), not `predict_action()`.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dataset.root=PATH` | _(required)_ | Path to converted LeRobot dataset |
+| `--dataset.video_backend=BACKEND` | lerobot's auto-detect (usually `torchcodec`) | Video decoding backend: `torchcodec` · `pyav` · `video_reader`. **Set to `pyav`** if you see `torchcodec` fail to load its native library (`RuntimeError: Could not load libtorchcodec...`) — this happens when the installed torch build doesn't match any of torchcodec's prebuilt binaries, which is common after installing a non-default torch (e.g. GR00T's pinned `torch==2.9.0+cu130`, or any other CUDA-version override). `anvil-eval` has the same flag for the same reason. |
 | `--policy.type=TYPE` | _(required)_ | Policy type (see table above) |
 | `--job_name=NAME` | `<policy>_<timestamp>` | Checkpoint directory name |
 | `--steps=N` | `100000` | Total training steps |
@@ -367,7 +369,9 @@ Defaults to `100`. Controls how many future actions the model predicts per forwa
 --policy.chunk_size=50
 ```
 
-> `n_action_steps` (how many of those actions are executed before re-querying) is an inference setting, not a training parameter — the training loss does not use it. It is baked into `config.json` with a default value at training time, but tuned at inference via `inference_tuning.n_action_steps` in the inference YAML without retraining.
+> `n_action_steps` (how many of those actions are executed before re-querying) is an inference setting, not a training parameter — the training loss does not use it. It is baked into `config.json` with a default value at training time, but tuned at inference via `inference_tuning.act.n_action_steps` in the inference YAML without retraining.
+>
+> **Gotcha:** if you're retraining the same task on more/different data and expect an apples-to-apples comparison against a prior checkpoint, explicitly pass `--policy.n_action_steps` matching the earlier run rather than relying on memory or a default — it's easy to accidentally train two checkpoints with different values and mistake the resulting behavior difference (e.g. oscillation from more frequent re-planning) for a data or model-quality problem. Check `config.json` of the checkpoint you're comparing against first.
 
 **kl_weight**
 
@@ -500,6 +504,23 @@ By default, the vision encoder is frozen (`freeze_vision_encoder=true`) and only
 
 30k–50k steps from a pretrained base is usually sufficient. The default LR scheduler decays over 30k steps, which aligns well with this range.
 
+**`chunk_size` and real-time deployment safety**
+
+SmolVLA runs on Anvil's background-thread (RTC) inference path (see
+[inference.md](inference.md)), which needs `chunk_size` to comfortably exceed
+the model's *real* per-call inference latency, expressed in control-loop
+steps (latency_seconds × control_frequency). If `chunk_size` is too small
+relative to real latency, the RTC action queue can empty faster than new
+chunks arrive — at best causing visible stuttering, at worst (if latency
+ever exceeds the full chunk) a total non-movement failure. This isn't
+theoretical: it's exactly what broke GR00T's deployment (its chunk is fixed
+at 16 by the checkpoint architecture, far below its own multi-second
+latency). Measure your real per-call latency on target hardware before
+committing to a `chunk_size` for a task with tight real-time requirements,
+and size it with real margin, not just architectural defaults — this project
+found `chunk_size=300` necessary against SmolVLA's measured 2-3s latency,
+well above the (much smaller) architectural default.
+
 ---
 
 ### Pi0.5
@@ -552,6 +573,8 @@ uv run anvil-trainer \
 | `--batch_size=16` | Starting point — reduce if GPU OOM |
 | `--num_workers=0` | Prevents CPU RAM OOM — forked workers each copy the full model |
 
+> **`num_workers=0` tradeoff:** this serializes video decoding with each training step instead of overlapping it with GPU compute in a background worker process. On one run this made training almost entirely data-loading-bound — GPU utilization sat near 0% between short compute bursts, and wall-clock time per step was dominated by CPU-side video decode, not model compute. If you have CPU RAM headroom, try `--num_workers=2` or higher and watch `nvidia-smi` utilization to check whether you're actually GPU-bound before accepting a long training time as inherent to the model.
+
 **Normalization:**
 
 Pi0.5's default normalization is `QUANTILE10`, which requires `q01`/`q99` stats not produced by `mcap-convert`. Two options:
@@ -572,6 +595,22 @@ main()
 > **Warning:** this modifies the dataset in-place. Back up first: `cp -r data/datasets/my-dataset data/datasets/my-dataset.bak`
 
 After augmentation you can omit `--policy.normalization_mapping` and use the default `QUANTILE10`.
+
+**`chunk_size` and real-time deployment safety**
+
+Same RTC-deployment consideration as [SmolVLA](#smolvla) above applies here,
+more acutely — Pi0.5 is a much larger model (~4B vs SmolVLA's ~500M) and
+measured substantially higher real inference latency on the same hardware in
+this project (mean ~6s, p95 ~9.3s, vs SmolVLA's 2-3s). `chunk_size=400` was
+used here specifically to keep well clear of that latency even in the tail,
+at the cost of longer/slower training (larger `chunk_size` means a longer
+action-token sequence in the action expert, which measurably slowed training
+in addition to the `num_workers=0` effect above). Even with a generously
+sized chunk, also check `inference_tuning.rtc.queue_trigger_threshold` in the
+inference YAML — it governs how early the background thread starts computing
+the *next* chunk, and needs to leave enough head start (`threshold /
+control_frequency` seconds) to cover the real latency, independent of
+`chunk_size` itself. See [inference.md](inference.md) for the full mechanism.
 
 ---
 

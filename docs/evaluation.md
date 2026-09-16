@@ -41,6 +41,7 @@ Produces per-joint trajectory plots and a summary box plot.
 | `--episodes "0,3,5"` | — | Manually specify episode indices (overrides `--split`) |
 | `--output-dir PATH` | auto | Output dir (default: `eval_results/{dataset}/{job}/{checkpoint}/raw`) |
 | `--device DEVICE` | `cuda` | Inference device: `cuda` or `cpu` |
+| `--video-backend BACKEND` | auto | Video decoding backend: `torchcodec` · `pyav` · `video_reader`. Use `pyav` if torchcodec's native library fails to load (can happen after installing a non-default torch build — see [training.md](training.md#common-parameters)'s `--dataset.video_backend` note) |
 | `--task-description TEXT` | — | VLA task prompt — overrides `anvil_config.json` (SmolVLA / Pi0.5 only) |
 | `--seed N` | `42` | Random seed for episode sampling |
 
