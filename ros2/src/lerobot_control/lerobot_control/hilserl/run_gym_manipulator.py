@@ -22,17 +22,9 @@ from lerobot_control.hilserl import teleop_anvil_openarm_leader  # noqa: F401 --
 def main() -> None:
     from lerobot.rl.gym_manipulator import main as gym_manipulator_main
 
-    from lerobot_control.hilserl.patches import (
-        patch_ee_bounds_and_safety_to_clamp_not_crash,
-        patch_inverse_kinematics_to_always_reseed_from_real_joints,
-        patch_map_delta_action_for_gripperless_robots,
-        patch_robot_env_reset_to_keep_publishing,
-    )
+    from lerobot_control.hilserl.patches import apply_all_patches
 
-    patch_map_delta_action_for_gripperless_robots()
-    patch_ee_bounds_and_safety_to_clamp_not_crash()
-    patch_inverse_kinematics_to_always_reseed_from_real_joints()
-    patch_robot_env_reset_to_keep_publishing()
+    apply_all_patches()
     gym_manipulator_main()
 
 

@@ -36,6 +36,8 @@ setup(
             "inference_monitor_node = lerobot_control.inference_monitor_node:main",
             "hilserl_gym_manipulator = lerobot_control.hilserl.run_gym_manipulator:main",
             "hilserl_live_ee_position = lerobot_control.hilserl.live_ee_position:main",
+            "hilserl_actor = lerobot_control.hilserl.run_actor:main",
+            "hilserl_learner = lerobot_control.hilserl.run_learner:main",
         ],
     },
 )

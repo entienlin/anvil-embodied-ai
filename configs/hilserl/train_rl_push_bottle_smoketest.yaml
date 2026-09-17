@@ -1,0 +1,124 @@
+# =============================================================================
+# HIL-SERL Stage 6: actor + learner smoke test (push-bottle task)
+# =============================================================================
+# TrainRLServerPipelineConfig shape (lerobot/configs/train.py), NOT
+# GymManipulatorConfig -- this is a genuinely different config class from
+# env_push_bottle.yaml, even though most of the env: block below is copied
+# from it unchanged. Key difference: TrainRLServerPipelineConfig.env is a
+# polymorphic EnvConfig field (draccus ChoiceRegistry), so env.type must be
+# set explicitly -- GymManipulatorConfig.env is concretely typed and never
+# needed this.
+#
+# Usage (two separate processes, learner first):
+#   ros2 run lerobot_control hilserl_learner --config_path configs/hilserl/train_rl_push_bottle_smoketest.yaml
+#   ros2 run lerobot_control hilserl_actor --config_path configs/hilserl/train_rl_push_bottle_smoketest.yaml
+#
+# Purpose: confirm the gRPC actor<->learner round trip and a handful of real
+# SAC gradient steps run cleanly -- NOT a real training run. Deliberately
+# small buffers/step counts, dataset omitted (pure online, simplest first
+# pass -- see the plan's Stage 6 notes for why), torch.compile disabled
+# (avoids first-compile latency looking like a hang during a short test).
+#
+# SAFETY NOTE (why this reuses env_push_bottle.yaml's TIGHT, real, measured
+# end_effector_bounds rather than any wider box): the actor publishes a
+# freshly-initialized (untrained) policy's raw output to the real robot
+# starting from its very first control step, with no exploration gating --
+# confirmed via source read, lerobot 0.5.1's SACPolicy.select_action has no
+# random/epsilon branch, it's always self.actor(batch). Tight bounds are
+# the actual safety margin here, not a placeholder to be loosened.
+
+env:
+  type: gym_manipulator
+  name: real_robot
+  fps: 10
+
+  robot:
+    type: anvil_openarm_follower
+    ros_prefix: follower_r
+    joint_state_topic: /joint_states
+    command_topic: /follower_r_forward_position_controller/commands
+    num_joints: 7
+    camera_topics:
+      wrist_r: /cam_wrist_r/image_raw/compressed
+    control_frequency: 10.0
+    max_position_delta: 0.30
+    obs_timeout_s: 2.0
+
+  teleop:
+    type: anvil_openarm_leader
+    ros_prefix: leader_r
+    joint_state_topic: /joint_states
+    num_joints: 7
+    urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+    target_frame_name: leader_r_hand_tcp
+    step_sizes:
+      x: 0.02
+      y: 0.02
+      z: 0.02
+    obs_timeout_s: 2.0
+    policy_controller: follower_r_forward_position_controller
+    teleop_controller: teleop_controller
+    follower_command_topic: /follower_r_forward_position_controller/commands
+    follower_joint_prefix: follower_r
+
+  processor:
+    control_mode: leader
+
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false
+      display_cameras: false
+
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+
+    gripper:
+      use_gripper: false
+
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 10.0
+      control_time_s: 20.0
+      terminate_on_success: true
+
+    inverse_kinematics:
+      urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+      target_frame_name: follower_r_hand_tcp
+      end_effector_bounds:
+        min: [-0.0247, -0.4427, 0.1117]
+        max: [0.4159, 0.0418, 0.3090]
+      end_effector_step_sizes:
+        x: 0.02
+        y: 0.02
+        z: 0.02
+
+    reward_classifier: null
+
+# Omitted deliberately for the first smoke test -- including it pulls in
+# make_dataset(cfg) at learner startup (learner.py) against our custom
+# camera/robot dataset schema, untested for this path. Pure online RL is
+# the simpler first pass; add dataset.repo_id: SSTC-AITeam/hilserl-push-bottle
+# once this smoke test passes clean.
+# dataset:
+#   repo_id: SSTC-AITeam/hilserl-push-bottle
+
+policy:
+  type: sac
+  device: cuda
+  push_to_hub: false  # defaults to true (PreTrainedConfig's own default) -- validate() requires policy.repo_id otherwise
+  use_torch_compile: false  # avoid first-compile latency masking real errors as a hang, in a short test
+  online_steps: 60  # just enough to exercise a handful of real gradient steps
+  online_step_before_learning: 10  # start training quickly rather than waiting for 100 real robot steps
+  online_buffer_capacity: 2000
+  offline_buffer_capacity: 2000
+  actor_learner_config:
+    learner_host: 127.0.0.1
+    learner_port: 50051
+
+output_dir: outputs/hilserl_push_bottle_smoketest
+job_name: hilserl_push_bottle_smoketest
+seed: 42
+wandb:
+  enable: false

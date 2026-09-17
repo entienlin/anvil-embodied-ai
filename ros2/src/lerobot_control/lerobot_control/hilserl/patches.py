@@ -296,3 +296,73 @@ def patch_robot_env_reset_to_keep_publishing() -> None:
 
     RobotEnv.reset = _patched_reset
     RobotEnv._anvil_reset_keepalive_patch_applied = True
+
+
+def apply_all_patches() -> None:
+    """Single entry point for every runtime patch in this file. All of
+    lerobot.rl.gym_manipulator's make_robot_env()/make_processors() pipeline
+    is reused UNCHANGED by lerobot.rl.actor and lerobot.rl.learner (confirmed
+    via direct import: actor.py imports create_transition/make_processors/
+    make_robot_env/step_env_and_process_transition from gym_manipulator.py
+    itself, not a separate implementation) -- every one of these patches
+    applies equally to the actor/learner path, not just the recording path
+    hilserl_gym_manipulator uses. This matters more there, not less: the
+    actor publishes a freshly-initialized (untrained) policy's raw output
+    straight to the real robot from its very first control step, with no
+    exploration gating -- exactly the kind of out-of-distribution input
+    that the EEBoundsAndSafety crash-vs-clamp bug is most likely to hit.
+    Call this from every entrypoint that reaches that pipeline, not just
+    hilserl_gym_manipulator's own.
+    """
+    patch_map_delta_action_for_gripperless_robots()
+    patch_ee_bounds_and_safety_to_clamp_not_crash()
+    patch_inverse_kinematics_to_always_reseed_from_real_joints()
+    patch_robot_env_reset_to_keep_publishing()
+    patch_train_pipeline_config_validate_for_optional_dataset()
+
+
+def patch_train_pipeline_config_validate_for_optional_dataset() -> None:
+    """Stage 6 finding: `TrainRLServerPipelineConfig.dataset` is explicitly
+    typed `DatasetConfig | None = None` (lerobot/configs/train.py:216) --
+    the RL pipeline config deliberately makes the offline dataset optional,
+    since HIL-SERL can train purely online. But `validate()`
+    (`TrainPipelineConfig.validate()`, inherited unchanged -- the RL
+    subclass never overrides it) does `if isinstance(self.dataset.repo_id,
+    list):` unconditionally, with no `self.dataset is not None` guard.
+    Confirmed directly: `cfg.validate()` raises `AttributeError: 'NoneType'
+    object has no attribute 'repo_id'` the moment `dataset:` is omitted from
+    the config -- and both `actor.py` and `learner.py` call `cfg.validate()`
+    unconditionally at startup, so this blocks the simplest ("pure online,
+    no dataset") smoke-test path entirely, not just an edge case.
+
+    Fix: wrap `validate()` so that when `self.dataset is None`, it
+    temporarily stands in a minimal duck-typed placeholder (only `.repo_id`
+    and `.root` are ever read by the rest of the method) for the duration
+    of the original call, then restores `self.dataset` to `None`
+    afterward -- every other line of the original method's logic runs
+    completely unmodified, and the rest of actor.py/learner.py (which
+    checks `cfg.dataset is not None` to decide whether to load an offline
+    dataset at all) still correctly sees `None` and skips it, exactly the
+    intended pure-online behavior.
+    """
+    from lerobot.configs.train import TrainPipelineConfig
+
+    if getattr(TrainPipelineConfig, "_anvil_optional_dataset_validate_patch_applied", False):
+        return
+
+    import types
+
+    _orig_validate = TrainPipelineConfig.validate
+
+    def _patched_validate(self):
+        if self.dataset is None:
+            self.dataset = types.SimpleNamespace(repo_id=None, root=None)
+            try:
+                _orig_validate(self)
+            finally:
+                self.dataset = None
+        else:
+            _orig_validate(self)
+
+    TrainPipelineConfig.validate = _patched_validate
+    TrainPipelineConfig._anvil_optional_dataset_validate_patch_applied = True
