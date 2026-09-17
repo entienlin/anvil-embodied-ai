@@ -76,7 +76,7 @@ env:
       fixed_reset_joint_positions: null  # reset_follower_position() needs robot.bus.sync_read(), which
                                           # this ROS2-native Robot deliberately doesn't have -- manual/
                                           # teleop reset for v1, a known accepted limitation (see plan)
-      reset_time_s: 5.0
+      reset_time_s: 10.0
       control_time_s: 20.0  # generous for a "5-10s" task per HIL-SERL's own guidance; tighten once tuned
       terminate_on_success: true
 

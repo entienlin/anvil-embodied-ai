@@ -125,6 +125,26 @@ class AnvilOpenArmFollower(Robot):
         self._last_publish_time: float | None = None
         self._publish_gap_warn_threshold_s = 0.25
 
+        # Real hardware finding: reset()'s blocking sleep (already patched
+        # in patches.py) was NOT the only source of multi-second publish
+        # gaps -- dataset.save_episode()'s own encoding/write I/O, which
+        # runs BEFORE reset() is even called, produces its own gap of up
+        # to several seconds (confirmed via the warning above: 0.4-3.2s
+        # gaps on every episode boundary in a clean, fault-free run,
+        # staying comfortably under the ~5.3-5.5s threshold the fault has
+        # consistently appeared at in prior occurrences). Rather than
+        # patch every individual stock-lerobot blocking call that might
+        # produce a gap (reset(), save_episode(), and whatever else might
+        # exist), a dedicated heartbeat thread republishes the last-sent
+        # command on a fixed cadence regardless of what the main control
+        # thread is doing -- robust against gaps from ANY source, current
+        # or future.
+        self._publish_lock = threading.Lock()
+        self._last_sent_msg: Float64MultiArray | None = None
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_interval_s = 0.15
+
     # -- Robot ABC -----------------------------------------------------
 
     @property
@@ -175,6 +195,11 @@ class AnvilOpenArmFollower(Robot):
         self._spin_stop.clear()
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin_thread.start()
+
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+
         self._is_connected = True
 
         # gym_manipulator.py's main() never calls robot.disconnect() (no
@@ -204,6 +229,22 @@ class AnvilOpenArmFollower(Robot):
     def _spin_loop(self) -> None:
         while not self._spin_stop.is_set() and rclpy.ok():
             self._executor.spin_once(timeout_sec=0.05)
+
+    def _heartbeat_loop(self) -> None:
+        """Republishes the last-sent command if send_action() hasn't been
+        called recently, so the command topic is never silent for longer
+        than self._heartbeat_interval_s regardless of what the main
+        control thread is doing (dataset I/O, video encoding, a blocking
+        reset() wait, etc.). See __init__'s comment for the full story."""
+        while not self._heartbeat_stop.is_set() and rclpy.ok():
+            time.sleep(self._heartbeat_interval_s)
+            with self._publish_lock:
+                if self._last_sent_msg is None or self._last_publish_time is None:
+                    continue
+                if time.monotonic() - self._last_publish_time < self._heartbeat_interval_s:
+                    continue  # send_action() itself published recently enough
+                self._pub.publish(self._last_sent_msg)
+                self._last_publish_time = time.monotonic()
 
     def _on_joint_state(self, msg: JointState) -> None:
         self._obs_manager.update_joint_state(msg)
@@ -290,24 +331,30 @@ class AnvilOpenArmFollower(Robot):
         out_msg = Float64MultiArray()
         out_msg.data = clamped_rad.tolist() + [gripper_hold_rad]
 
-        now = time.monotonic()
-        if self._last_publish_time is not None:
-            gap = now - self._last_publish_time
-            if gap > self._publish_gap_warn_threshold_s:
-                self._node.get_logger().warning(
-                    f"AnvilOpenArmFollower: {gap:.3f}s gap since last publish to "
-                    f"{self.config.command_topic} (expected ~0.1s at 10Hz) -- "
-                    "diagnostic instrumentation for the 'follower dead' investigation."
-                )
-        self._last_publish_time = now
-
-        self._pub.publish(out_msg)
+        with self._publish_lock:
+            now = time.monotonic()
+            if self._last_publish_time is not None:
+                gap = now - self._last_publish_time
+                if gap > self._publish_gap_warn_threshold_s:
+                    self._node.get_logger().warning(
+                        f"AnvilOpenArmFollower: {gap:.3f}s gap since last publish to "
+                        f"{self.config.command_topic} (expected ~0.1s at 10Hz) -- "
+                        "the heartbeat thread should now prevent this from ever "
+                        "exceeding ~0.15s in practice; a large gap here would mean "
+                        "even the heartbeat itself got starved."
+                    )
+            self._last_publish_time = now
+            self._last_sent_msg = out_msg
+            self._pub.publish(out_msg)
 
         return {f"{j}.pos": float(np.rad2deg(v)) for j, v in zip(self.joint_names, clamped_rad, strict=False)}
 
     def disconnect(self) -> None:
         if not self._is_connected:
             return
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2.0)
         self._spin_stop.set()
         if self._spin_thread is not None:
             self._spin_thread.join(timeout=2.0)
