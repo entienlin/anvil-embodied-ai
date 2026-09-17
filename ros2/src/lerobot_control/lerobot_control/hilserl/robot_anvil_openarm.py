@@ -217,6 +217,7 @@ class AnvilOpenArmFollower(Robot):
         deadline = time.monotonic() + self.config.obs_timeout_s * 3
         while time.monotonic() < deadline:
             if self._obs_manager.has_complete_observation(list(self.config.camera_topics)):
+                self._seed_heartbeat_from_current_position()
                 return
             time.sleep(0.05)
         raise RuntimeError(
@@ -243,8 +244,56 @@ class AnvilOpenArmFollower(Robot):
                     continue
                 if time.monotonic() - self._last_publish_time < self._heartbeat_interval_s:
                     continue  # send_action() itself published recently enough
+                # rclpy.shutdown() can be triggered from elsewhere in the
+                # process (lerobot's own SIGINT handling in
+                # lerobot.rl.process, unrelated to our own disconnect()) --
+                # reproduced on real hardware: this thread and
+                # AnvilOpenArmLeader.disconnect()'s give-back both hit
+                # "publisher's context is invalid" during actor.py's
+                # shutdown. Only a shutdown-time cosmetic error (the real
+                # control window is already over by then), but check
+                # rclpy.ok() again right before publishing to avoid it.
+                if not rclpy.ok():
+                    return
                 self._pub.publish(self._last_sent_msg)
                 self._last_publish_time = time.monotonic()
+
+    def _seed_heartbeat_from_current_position(self) -> None:
+        """Real hardware finding (Stage 6): the heartbeat above only
+        republishes `self._last_sent_msg`, which stayed `None` until the
+        first successful `send_action()` call -- meaning it provided ZERO
+        protection during the gap between connect() finishing and that
+        first call. The actor path's first real policy inference is a cold
+        start (model/GPU warmup) that took ~6s in practice ("Policy FPS 1.1
+        below required 10 at step 0"), well past the fault's observed
+        ~5.3-5.5s threshold -- and the devbox's motor-status log confirmed
+        the fault landed in exactly this window, with no reset()/switch
+        anywhere nearby (ruling out every previously-suspected gap source
+        and independently ruling out a fixed activation-timer explanation
+        too, via a separate 39.5-minute idle-with-no-fault data point).
+
+        Fix: seed `_last_sent_msg` here, immediately once a real
+        observation is available (before connect() ever returns), using
+        the robot's OWN current actual position as the initial hold target
+        -- the same "echo back reality, command no real motion" principle
+        already used for the gripper-hold value and the bumpless-transfer
+        pre-publish. Closes the one remaining unprotected window: from
+        connect() completing to whatever calls send_action() first,
+        however long that turns out to take.
+        """
+        msg = self._obs_manager.latest_joint_state
+        if msg is None:
+            return
+        name_to_pos = dict(zip(msg.name, msg.position, strict=False))
+        if not all(j in name_to_pos for j in [*self.joint_names, self.gripper_joint_name]):
+            return
+
+        hold_msg = Float64MultiArray()
+        hold_msg.data = [name_to_pos[j] for j in self.joint_names] + [name_to_pos[self.gripper_joint_name]]
+
+        with self._publish_lock:
+            self._last_sent_msg = hold_msg
+            self._last_publish_time = time.monotonic()
 
     def _on_joint_state(self, msg: JointState) -> None:
         self._obs_manager.update_joint_state(msg)

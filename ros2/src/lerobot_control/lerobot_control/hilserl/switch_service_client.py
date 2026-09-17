@@ -21,6 +21,7 @@ assumption -- see _switch_to()'s docstring.
 
 import time
 
+import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
@@ -103,6 +104,16 @@ class SwitchServiceClient:
         so it doesn't snap to whatever stale target was last commanded
         before the teleop interlude.
         """
+        # rclpy.shutdown() can be triggered from elsewhere in the process
+        # (lerobot's own SIGINT handling, unrelated to our own
+        # disconnect()) -- reproduced on real hardware: this call, invoked
+        # from AnvilOpenArmLeader.disconnect()'s give-back, hit "publisher's
+        # context is invalid" mid-shutdown. The give-back is moot anyway if
+        # rclpy is already down (nothing can be published/serviced), so
+        # fail cleanly instead of raising into an atexit callback.
+        if not rclpy.ok():
+            return False
+
         if self._latest_joint_state is not None and self._joint_names:
             name_to_pos = dict(zip(self._latest_joint_state.name, self._latest_joint_state.position, strict=False))
             if all(j in name_to_pos for j in self._joint_names):
