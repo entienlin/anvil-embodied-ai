@@ -110,6 +110,20 @@ class AnvilOpenArmFollower(Robot):
         self._spin_stop = threading.Event()
         self._pub = None
         self._is_connected = False
+        # Diagnostic instrumentation (real-hardware investigation): the
+        # "follower dead" pattern has recurred 5 times with inconsistent
+        # timing relative to switch_controller/reset() events. Neither side
+        # has ever had direct proof of whether OUR publishes to this
+        # topic actually had a gap right before a given occurrence, or
+        # whether they were flowing continuously and something else
+        # (a fixed timer since controller activation?) is responsible.
+        # Logs a WARNING (visible in the same terminal output already
+        # being shared) whenever the gap between consecutive send_action()
+        # publishes exceeds this threshold -- comfortably above the
+        # expected ~100ms (10Hz) cadence, so it only fires on a real
+        # anomaly, not normal jitter.
+        self._last_publish_time: float | None = None
+        self._publish_gap_warn_threshold_s = 0.25
 
     # -- Robot ABC -----------------------------------------------------
 
@@ -275,6 +289,18 @@ class AnvilOpenArmFollower(Robot):
 
         out_msg = Float64MultiArray()
         out_msg.data = clamped_rad.tolist() + [gripper_hold_rad]
+
+        now = time.monotonic()
+        if self._last_publish_time is not None:
+            gap = now - self._last_publish_time
+            if gap > self._publish_gap_warn_threshold_s:
+                self._node.get_logger().warning(
+                    f"AnvilOpenArmFollower: {gap:.3f}s gap since last publish to "
+                    f"{self.config.command_topic} (expected ~0.1s at 10Hz) -- "
+                    "diagnostic instrumentation for the 'follower dead' investigation."
+                )
+        self._last_publish_time = now
+
         self._pub.publish(out_msg)
 
         return {f"{j}.pos": float(np.rad2deg(v)) for j, v in zip(self.joint_names, clamped_rad, strict=False)}
