@@ -1,0 +1,59 @@
+env:
+  name: real_robot
+  fps: 10
+
+  robot:
+    type: anvil_openarm_follower
+    ros_prefix: follower_r
+    joint_state_topic: /joint_states
+    command_topic: /follower_r_forward_position_controller/commands
+    num_joints: 7
+    camera_topics:
+      wrist_r: /cam_wrist_r/image_raw/compressed
+    control_frequency: 10.0
+    max_position_delta: 0.30
+    obs_timeout_s: 5.0
+
+  teleop:
+    type: keyboard_ee
+    use_gripper: false
+
+  processor:
+    control_mode: gamepad
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false  # see env_push_bottle.yaml comment: KeyError('gripper.pos') for gripper-less robots when true
+      display_cameras: false
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+    gripper:
+      use_gripper: false
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 2.0
+      control_time_s: 5.0
+      terminate_on_success: true
+    inverse_kinematics:
+      urdf_path: /workspace/configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+      target_frame_name: follower_r_hand_tcp
+      end_effector_bounds:
+        min: [0.10, -0.30, 0.00]
+        max: [0.40, 0.30, 0.40]
+      end_effector_step_sizes:
+        x: 0.02
+        y: 0.02
+        z: 0.02
+    reward_classifier: null
+
+dataset:
+  repo_id: SSTC-AITeam/hilserl-stage3-test
+  root: /tmp/stage3_dataset
+  task: "stage3 dry run"
+  num_episodes_to_record: 1
+  replay_episode: null
+  push_to_hub: false
+
+mode: record
+device: cpu

@@ -1,0 +1,114 @@
+# Stage 5 test-only config: first real-hardware run, mode: record, no SAC.
+# NOT the production task config (that's env_push_bottle.yaml) -- delete
+# this file (or keep as a dev tool) once Stage 5 passes.
+#
+# Differs from env_push_bottle.yaml in exactly two ways, both deliberate:
+#
+# 1. end_effector_bounds widened to something no real OpenArm pose could
+#    reach, instead of env_push_bottle.yaml's placeholder numbers. Checked
+#    directly: follower_r's EE position at the all-zeros pose is
+#    x=0.0, which is OUTSIDE env_push_bottle.yaml's placeholder box
+#    (x_min=0.10) -- meaning a "hold current position" (zero-delta) command
+#    near home would get CLAMPED into an unintended ~10cm motion, purely
+#    from a wrong guessed box, not from any real intent. EEBoundsAndSafety
+#    clips rather than rejects, so a wrong box causes silent unwanted
+#    motion rather than a loud error. Stage 5 has no autonomous policy yet
+#    (record-mode: motion is either human-driven leader mirroring, which
+#    bypasses this entirely via the native devbox teleop_controller, or
+#    hold-still zero-delta) -- so there's no need for tight bounds here,
+#    only for them to not clip anything. Real, tight bounds (jog follower_r
+#    to the task's actual safe-region corners, read /joint_states, FK to
+#    get the real box) are still required before Stage 6 (SAC), where an
+#    exploring policy actually needs to be constrained -- NOT done here,
+#    this is a Stage-5-only workaround.
+# 2. dataset.root/repo_id/num_episodes_to_record are test-only (disposable
+#    output, 1 episode) instead of the real production dataset.
+
+env:
+  name: real_robot
+  fps: 10
+
+  robot:
+    type: anvil_openarm_follower
+    ros_prefix: follower_r
+    joint_state_topic: /joint_states
+    command_topic: /follower_r_forward_position_controller/commands
+    num_joints: 7
+    camera_topics:
+      wrist_r: /cam_wrist_r/image_raw/compressed
+    control_frequency: 10.0
+    max_position_delta: 0.30
+    obs_timeout_s: 2.0
+
+  teleop:
+    type: anvil_openarm_leader
+    ros_prefix: leader_r
+    joint_state_topic: /joint_states
+    num_joints: 7
+    urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+    target_frame_name: leader_r_hand_tcp
+    step_sizes:
+      x: 0.02
+      y: 0.02
+      z: 0.02
+    obs_timeout_s: 2.0
+    policy_controller: follower_r_forward_position_controller
+    teleop_controller: teleop_controller
+    follower_command_topic: /follower_r_forward_position_controller/commands
+    follower_joint_prefix: follower_r
+
+  processor:
+    control_mode: leader
+
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false  # see env_push_bottle.yaml comment: KeyError('gripper.pos') for gripper-less robots when true
+      display_cameras: false
+
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+
+    gripper:
+      use_gripper: false
+
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 5.0
+      control_time_s: 20.0
+      terminate_on_success: true
+
+    inverse_kinematics:
+      urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+      target_frame_name: follower_r_hand_tcp
+      # Deliberately wide -- see the file-level comment above. No real
+      # OpenArm pose can reach 1 meter from its own base in any axis.
+      end_effector_bounds:
+        min: [-1.0, -1.0, -1.0]
+        max: [1.0, 1.0, 1.0]
+      end_effector_step_sizes:
+        x: 0.02
+        y: 0.02
+        z: 0.02
+
+    reward_classifier: null
+
+dataset:
+  repo_id: SSTC-AITeam/hilserl-stage5-test
+  # LeRobotDataset.create() does obj.root.mkdir(parents=True, exist_ok=False)
+  # -- refuses to create a dataset at a path that already exists as a
+  # directory, even if empty. A Docker bind-mount always presents its
+  # mountpoint as an existing directory, so mounting a host dir directly
+  # onto this exact path can never work (confirmed the hard way:
+  # FileExistsError on the very first real attempt with a mount). Mount the
+  # PARENT directory instead (e.g. -v host_dir:/tmp/stage5_host) and point
+  # this at a NOT-yet-existing subdirectory inside it.
+  root: /tmp/stage5_host/stage5_dataset
+  task: "stage5 real-hardware dry run"
+  num_episodes_to_record: 1
+  replay_episode: null
+  push_to_hub: false
+
+mode: record
+device: cuda

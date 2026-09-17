@@ -44,6 +44,38 @@ RUN LEROBOT_PIP_EXTRAS="$(echo "${LEROBOT_EXTRAS}" | tr ',' '\n' | grep -vx 'gro
             "lerobot[${LEROBOT_PIP_EXTRAS}]==${LEROBOT_VERSION}"; \
     fi
 
+# hilserl extra pulls placo (kinematics) transitively via `pin` (Pinocchio).
+# placo's prebuilt wheel is compiled against older SONAMEs than what pip's
+# resolver picks for pin's own cmeel-urdfdom/cmeel-tinyxml2 deps — confirmed
+# directly on the host venv: placo fails to import with
+# "liburdfdom_sensor.so.4.0: cannot open shared object file" (wants
+# cmeel-urdfdom<5, resolver picks 6.x) and then "libtinyxml2.so.10: cannot
+# open shared object file" (wants cmeel-tinyxml2<11, resolver picks 11.x)
+# once the first is pinned down. Both are real ABI mismatches in the
+# placo/pin packaging, not this project's doing — pin them down explicitly
+# whenever hilserl is requested.
+RUN if echo "${LEROBOT_EXTRAS}" | tr ',' '\n' | grep -qx 'hilserl'; then \
+        pip3 install --break-system-packages --no-cache-dir \
+            "cmeel-urdfdom<5" "cmeel-tinyxml2<11"; \
+    fi
+
+# hilserl's keyboard-based Teleoperators (stock KeyboardEndEffectorTeleop and
+# our own keyboard_intervention.py) use pynput, which needs a real X11
+# DISPLAY at IMPORT time, not just at use -- fails immediately in this
+# headless container otherwise. xvfb-run gives it one without an actual
+# display attached.
+#
+# ros-jazzy-controller-manager-msgs: switch_service_client.py imports
+# controller_manager_msgs.srv.SwitchController (deferred inside __init__,
+# so Stages 3/4's tests never exercised this path and it went unnoticed
+# until Stage 1) -- message-definitions-only package, no controller_manager
+# runtime needed since we only ever call the service, never host it.
+RUN if echo "${LEROBOT_EXTRAS}" | tr ',' '\n' | grep -qx 'hilserl'; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            xvfb ros-jazzy-controller-manager-msgs && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # GR00T layer — only built when LEROBOT_EXTRAS contains "groot".
 #
 # GR00T N1.5 wraps an Eagle-2.5-VL backbone that HARD-REQUIRES flash-attn:

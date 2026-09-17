@@ -1,0 +1,109 @@
+# =============================================================================
+# HIL-SERL: push-bottle-to-target-zone (first experiment, single arm)
+# =============================================================================
+# GymManipulatorConfig structure per lerobot/rl/gym_manipulator.py.
+# Usage: ros2 run lerobot_control hilserl_gym_manipulator --config_path <this file>
+#
+# STAGE 3 NOTE: for the stock-keyboard dry run (de-risking step before the
+# real leader-arm teleoperator), swap `env.teleop.type` below to `keyboard_ee`
+# (lerobot.teleoperators.keyboard.KeyboardEndEffectorTeleopConfig) and remove
+# the anvil_openarm_leader-specific fields -- zero other changes needed,
+# since AnvilOpenArmFollower doesn't care which Teleoperator is paired with it.
+
+env:
+  name: real_robot
+  # HIL-SERL references run at 10Hz; this rig's cameras are chronically
+  # bottlenecked to ~14-20Hz even before ROS2 + switch-service latency --
+  # 10 is a reasonable start but MUST be measured for real (Stage 5), not
+  # assumed. See the plan's "control-frequency fit" risk.
+  fps: 10
+
+  robot:
+    type: anvil_openarm_follower
+    ros_prefix: follower_r
+    joint_state_topic: /joint_states
+    command_topic: /follower_r_forward_position_controller/commands
+    num_joints: 7
+    camera_topics:
+      wrist_r: /cam_wrist_r/image_raw/compressed
+    control_frequency: 10.0
+    max_position_delta: 0.30
+    obs_timeout_s: 2.0
+
+  teleop:
+    type: anvil_openarm_leader
+    ros_prefix: leader_r
+    joint_state_topic: /joint_states
+    num_joints: 7
+    urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+    target_frame_name: leader_r_hand_tcp
+    step_sizes:
+      x: 0.02
+      y: 0.02
+      z: 0.02
+    obs_timeout_s: 2.0
+    policy_controller: follower_r_forward_position_controller
+    teleop_controller: teleop_controller  # NOT arm-scoped -- confirmed via devbox source read, see teleop_anvil_openarm_leader.py
+    follower_command_topic: /follower_r_forward_position_controller/commands
+    follower_joint_prefix: follower_r
+
+  processor:
+    control_mode: leader  # our custom teleop provides continuous deltas, not discrete gamepad/keyboard steps
+
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      # lerobot 0.5.1's ForwardKinematicsJointsToEEObservation unconditionally
+      # reads joints["gripper.pos"] (robot_kinematic_processor.py:413), with
+      # no use_gripper check -- crashes with KeyError for any gripper-less
+      # robot when this flag is true. This is a pure observation convenience
+      # feature (EE pose surfaced to the SAC policy), unrelated to the
+      # action-side IK pipeline (InverseKinematicsRLStep), which still works
+      # correctly regardless of this flag.
+      add_ee_pose_to_observation: false
+      display_cameras: false
+
+    image_preprocessing:
+      # No crop determined yet -- collect a few episodes first, then run
+      # crop_dataset_roi.py per docs, same as any other HIL-SERL task.
+      crop_params_dict: {}
+      resize_size: [128, 128]
+
+    gripper:
+      use_gripper: false  # push task needs no grasp
+
+    reset:
+      fixed_reset_joint_positions: null  # reset_follower_position() needs robot.bus.sync_read(), which
+                                          # this ROS2-native Robot deliberately doesn't have -- manual/
+                                          # teleop reset for v1, a known accepted limitation (see plan)
+      reset_time_s: 5.0
+      control_time_s: 20.0  # generous for a "5-10s" task per HIL-SERL's own guidance; tighten once tuned
+      terminate_on_success: true
+
+    inverse_kinematics:
+      urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+      target_frame_name: follower_r_hand_tcp
+      # PLACEHOLDER -- must be collected empirically against the real rig
+      # before first use (jog follower_r to the task's safe-region corners,
+      # read /joint_states, FK to get the real box). Do NOT run with these
+      # placeholder numbers on real hardware.
+      end_effector_bounds:
+        min: [0.10, -0.30, 0.00]
+        max: [0.40, 0.30, 0.40]
+      end_effector_step_sizes:
+        x: 0.02
+        y: 0.02
+        z: 0.02
+
+    reward_classifier: null  # v1: manual success/failure via keyboard (see plan Part 2.6)
+
+dataset:
+  repo_id: SSTC-AITeam/hilserl-push-bottle
+  root: null
+  task: "push the white bottle into the marked target zone"
+  num_episodes_to_record: 15
+  replay_episode: null
+  push_to_hub: false
+
+mode: record  # switch to null once ready for actual RL training (Stage 6)
+device: cuda

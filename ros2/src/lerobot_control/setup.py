@@ -34,6 +34,7 @@ setup(
             "mcap_player_node = lerobot_control.mcap_player_node:main",
             "eval_recorder_node = lerobot_control.eval_recorder_node:main",
             "inference_monitor_node = lerobot_control.inference_monitor_node:main",
+            "hilserl_gym_manipulator = lerobot_control.hilserl.run_gym_manipulator:main",
         ],
     },
 )
