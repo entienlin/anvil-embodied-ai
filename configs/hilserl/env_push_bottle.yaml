@@ -109,7 +109,7 @@ dataset:
   # _stage5_test_config.yaml, see that file's comment for the full story.
   root: /tmp/push_bottle_host/push_bottle_demos
   task: "push the white bottle into the marked target zone"
-  num_episodes_to_record: 15
+  num_episodes_to_record: 5
   replay_episode: null
   push_to_hub: false
 
