@@ -101,7 +101,13 @@ env:
 
 dataset:
   repo_id: SSTC-AITeam/hilserl-push-bottle
-  root: null
+  # LeRobotDataset.create() does obj.root.mkdir(parents=True, exist_ok=False)
+  # -- refuses to create a dataset at a path that already exists, and a
+  # Docker bind-mount's target always presents as an existing directory.
+  # Mount the PARENT (e.g. -v host_dir:/tmp/push_bottle_host) and point this
+  # at a not-yet-existing subdirectory inside it -- same fix as
+  # _stage5_test_config.yaml, see that file's comment for the full story.
+  root: /tmp/push_bottle_host/push_bottle_demos
   task: "push the white bottle into the marked target zone"
   num_episodes_to_record: 15
   replay_episode: null
