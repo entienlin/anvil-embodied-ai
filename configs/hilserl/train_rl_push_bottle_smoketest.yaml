@@ -32,6 +32,39 @@ env:
   name: real_robot
   fps: 10
 
+  # Stage 6 finding: HILSerlRobotEnvConfig (unlike e.g. LiberoEnv) never
+  # populates features/features_map -- both default to {} on the base
+  # EnvConfig class. make_policy(env_cfg=...) -> env_to_policy_features()
+  # reads directly from these to build the SAC policy's input/output
+  # feature specs; left empty, SACConfig.validate_features() crashes with
+  # "You must provide either 'observation.state' or an image observation".
+  # Confirmed via source read (lerobot/envs/utils.py:113-129,
+  # lerobot/envs/configs.py:246-256) -- not something auto-derived from
+  # our Robot/Teleoperator classes' own observation_features/action_features
+  # for this env type. Declared explicitly here, matching this task's
+  # actual, already-validated shapes: 7 joint positions -> observation.state,
+  # one camera -> observation.images.wrist_r (at (128,128,3), the POST
+  # crop/resize shape from processor.image_preprocessing.resize_size below
+  # -- what the policy actually receives, not the raw camera resolution,
+  # which also happens to sidestep the fake-hardware (480x640) vs real
+  # (1080x1920) resolution mismatch entirely), and the 3-dim EE-delta
+  # action space (confirmed printed as `Box(-1.0, 1.0, (3,), float32)` in
+  # every prior stage's log).
+  features:
+    state:
+      type: STATE
+      shape: [7]
+    wrist_r_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    ee_delta_action:
+      type: ACTION
+      shape: [3]
+  features_map:
+    state: observation.state
+    wrist_r_image: observation.images.wrist_r
+    ee_delta_action: action
+
   robot:
     type: anvil_openarm_follower
     ros_prefix: follower_r
