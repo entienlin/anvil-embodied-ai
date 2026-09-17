@@ -225,3 +225,74 @@ def patch_inverse_kinematics_to_always_reseed_from_real_joints() -> None:
 
     InverseKinematicsRLStep.__call__ = _patched_call
     InverseKinematicsRLStep._anvil_always_reseed_patch_applied = True
+
+
+def patch_robot_env_reset_to_keep_publishing() -> None:
+    """Real hardware finding (Stage 5, real multi-episode collection):
+    `RobotEnv.reset()` (robots/so_follower's caller, `lerobot/rl/
+    gym_manipulator.py`) does a single blocking
+    `precise_sleep(reset_time_s)` between episodes with `reset_pose is
+    None` (our config -- `fixed_reset_joint_positions: null`, a known,
+    accepted limitation, see the plan). Confirmed directly from source:
+    during that entire multi-second window, ZERO commands are published to
+    `/follower_r_forward_position_controller/commands` -- not "usually
+    zero", structurally guaranteed zero every single reset, since nothing
+    else runs on this thread during the sleep.
+
+    The "follower dead" pattern recurred four times during real testing,
+    always arm-wide on follower_r specifically (never leader_r, which is
+    driven directly by the devbox's 500Hz teleop-mirroring loop with no
+    topic dependency at all) and always below what ros2_control's own
+    state reporting can see (every controller still shows "active").
+    Devbox's motor-status logging on the 4th occurrence localized the
+    fault to ~5.3s after follower_r_forward_position_controller was
+    activated -- squarely inside the window this reset() sleep (plus
+    dataset.save_episode()'s own I/O time) would occupy. Leading
+    hypothesis, well-supported by all of the above: a command-timeout
+    watchdog in the motor firmware disables torque if no fresh position
+    command arrives within some threshold, and this reset design
+    guarantees exactly that gap on every single episode boundary.
+
+    Fix: replace the blocking sleep with a loop that keeps republishing a
+    "hold at current position" command every 100ms for the same total
+    duration, so the command topic is never actually silent. Doesn't
+    change reset()'s real behavior or timing (still waits reset_time_s
+    before returning; still does the optional reset_follower_position()
+    first if reset_pose is configured) -- only removes the silent gap.
+    """
+    from lerobot.rl.gym_manipulator import RobotEnv
+
+    if getattr(RobotEnv, "_anvil_reset_keepalive_patch_applied", False):
+        return
+
+    import time as _time
+
+    import gymnasium as gym
+    import numpy as np
+    from lerobot.rl.gym_manipulator import log_say, reset_follower_position
+    from lerobot.teleoperators.utils import TeleopEvents
+    from lerobot.utils.robot_utils import precise_sleep
+
+    def _patched_reset(self, *, seed=None, options=None):
+        start_time = _time.perf_counter()
+        if self.reset_pose is not None:
+            log_say("Reset the environment.", play_sounds=True)
+            reset_follower_position(self.robot, np.array(self.reset_pose))
+            log_say("Reset the environment done.", play_sounds=True)
+
+        hold_obs = self.robot.get_observation()
+        hold_action = {f"{j}.pos": hold_obs[f"{j}.pos"] for j in self._joint_names}
+        while _time.perf_counter() - start_time < self.reset_time_s:
+            self.robot.send_action(hold_action)
+            precise_sleep(0.1)
+
+        gym.Env.reset(self, seed=seed, options=options)
+
+        self.current_step = 0
+        self.episode_data = None
+        obs = self._get_observation()
+        self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
+        return obs, {TeleopEvents.IS_INTERVENTION: False}
+
+    RobotEnv.reset = _patched_reset
+    RobotEnv._anvil_reset_keepalive_patch_applied = True
