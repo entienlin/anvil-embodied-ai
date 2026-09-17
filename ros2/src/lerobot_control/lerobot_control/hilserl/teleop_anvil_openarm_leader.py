@@ -334,6 +334,23 @@ class AnvilOpenArmLeader(Teleoperator):
 
     def get_teleop_events(self) -> dict:
         labels = self._keyboard.consume_episode_labels()
+
+        # Real hardware finding (Stage 5): pressing 's'/'f' ends the
+        # episode independently of the space-bar intervention toggle. If
+        # the user presses one WHILE STILL INTERVENING (without giving
+        # back via space first), the follower was left held by
+        # teleop_controller through the reset wait and beyond -- observed
+        # as the arm going "dead"/unresponsive. Originally fixed only at
+        # disconnect() (end of the whole script), but multi-episode
+        # collection hits this same episode-boundary reset on EVERY
+        # episode, not just the last one -- force the give-back here too,
+        # the moment success/failure is detected, rather than relying on
+        # keypress ordering being remembered correctly across many
+        # repeated episodes. Safe/idempotent: _handle_switch_edge is a
+        # no-op if we already gave back properly via space.
+        if (labels["success"] or labels["failure"]) and self._was_intervening:
+            self._handle_switch_edge(self._switch_client.switch_to_policy, target_was_intervening=False)
+
         return {
             TeleopEvents.IS_INTERVENTION: self._keyboard.is_intervention,
             TeleopEvents.SUCCESS: labels["success"],
