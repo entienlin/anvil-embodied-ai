@@ -83,13 +83,15 @@ env:
     inverse_kinematics:
       urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
       target_frame_name: follower_r_hand_tcp
-      # PLACEHOLDER -- must be collected empirically against the real rig
-      # before first use (jog follower_r to the task's safe-region corners,
-      # read /joint_states, FK to get the real box). Do NOT run with these
-      # placeholder numbers on real hardware.
+      # Measured empirically against the real rig via
+      # hilserl_live_ee_position (jogged follower_r through the task's
+      # safe region, tracked live FK min/max). Raw observed range was
+      # min=[0.0053, -0.4127, 0.1417], max=[0.3859, 0.0118, 0.2790];
+      # padded by 0.03m on each side below so the arm isn't clipped right
+      # at the literal edge of what was actually swept through.
       end_effector_bounds:
-        min: [0.10, -0.30, 0.00]
-        max: [0.40, 0.30, 0.40]
+        min: [-0.0247, -0.4427, 0.1117]
+        max: [0.4159, 0.0418, 0.3090]
       end_effector_step_sizes:
         x: 0.02
         y: 0.02
