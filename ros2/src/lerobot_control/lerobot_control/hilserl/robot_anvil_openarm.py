@@ -394,7 +394,15 @@ class AnvilOpenArmFollower(Robot):
                     )
             self._last_publish_time = now
             self._last_sent_msg = out_msg
-            self._pub.publish(out_msg)
+            # rclpy.shutdown() can be triggered elsewhere in the process
+            # (lerobot's own SIGINT handling) between this lock being
+            # acquired and the publish call below -- same race already
+            # guarded in _heartbeat_loop()/switch_to_policy(), but this
+            # call site (send_action()'s own direct publish, also reused
+            # by the reset-keepalive patch) was missed. A shutdown-time
+            # publish attempt here is a no-op, not a real failure.
+            if rclpy.ok():
+                self._pub.publish(out_msg)
 
         return {f"{j}.pos": float(np.rad2deg(v)) for j, v in zip(self.joint_names, clamped_rad, strict=False)}
 
