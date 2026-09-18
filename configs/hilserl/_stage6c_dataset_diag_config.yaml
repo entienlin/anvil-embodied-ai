@@ -1,0 +1,129 @@
+# =============================================================================
+# HIL-SERL Stage 6: real dataset-informed online training (push-bottle task)
+# =============================================================================
+# Successor to train_rl_push_bottle_smoketest.yaml, which only proved the
+# gRPC actor<->learner plumbing (online_steps: 60, dataset omitted). This
+# config is the first attempt at actual training: real dataset wired in
+# (RLPD-style 50/50 offline/online mixing once online_step_before_learning
+# is reached) and a step budget large enough for a handful of real gradient
+# updates to land, not just a connectivity check.
+#
+# Usage (two separate processes, learner first):
+#   ros2 run lerobot_control hilserl_learner --config_path configs/hilserl/train_rl_push_bottle.yaml
+#   ros2 run lerobot_control hilserl_actor --config_path configs/hilserl/train_rl_push_bottle.yaml --output_dir=outputs/hilserl_push_bottle_actor
+#
+# IMPORTANT, confirmed via direct source read (lerobot/policies/factory.py):
+# `dataset:` below does NOT pretrain the policy's weights before rollout.
+# make_policy() only loads pretrained weights via policy.pretrained_path
+# (unset here -- no SAC checkpoint exists yet, this run produces the first
+# one). The policy is still randomly initialized at step 0 regardless of
+# this dataset -- the dataset only feeds the learner's online/offline batch
+# mix (learner.py) once online_step_before_learning is passed. Expect the
+# actor to look rough/random for the whole run; that's expected, not a bug
+# -- see the plan's "Seventh occurrence and clarified untrained-policy
+# question" section for the full explanation.
+#
+# SAFETY NOTE (unchanged from the smoketest config): real, measured, tight
+# end_effector_bounds + AnvilOpenArmFollower's independent ActionLimiter
+# joint-space delta clamp are the actual safety margin for this untrained
+# policy's raw output, not anything about this dataset/step-count change.
+
+env:
+  type: gym_manipulator
+  name: real_robot
+  fps: 10
+
+  features:
+    state:
+      type: STATE
+      shape: [7]
+    wrist_r_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    ee_delta_action:
+      type: ACTION
+      shape: [3]
+  features_map:
+    state: observation.state
+    wrist_r_image: observation.images.wrist_r
+    ee_delta_action: action
+
+  robot:
+    type: anvil_openarm_follower
+    ros_prefix: follower_r
+    joint_state_topic: /joint_states
+    command_topic: /follower_r_forward_position_controller/commands
+    num_joints: 7
+    camera_topics:
+      wrist_r: /cam_wrist_r/image_raw/compressed
+    control_frequency: 10.0
+    max_position_delta: 0.30
+    obs_timeout_s: 2.0
+
+  teleop:
+    type: keyboard_ee
+    use_gripper: false
+
+  processor:
+    control_mode: leader
+
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false
+      display_cameras: false
+
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+
+    gripper:
+      use_gripper: false
+
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 10.0
+      control_time_s: 20.0
+      terminate_on_success: true
+
+    inverse_kinematics:
+      urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+      target_frame_name: follower_r_hand_tcp
+      end_effector_bounds:
+        min: [-0.0247, -0.4427, 0.1117]
+        max: [0.4159, 0.0418, 0.3090]
+      end_effector_step_sizes:
+        x: 0.02
+        y: 0.02
+        z: 0.02
+
+    reward_classifier: null
+
+# Real 5-episode/626-frame demo dataset from Stage 5 (env_push_bottle.yaml's
+# recording run). root is a container-internal path -- mount the HOST
+# directory that actually holds it (data/datasets/push_bottle_demos) at
+# this exact path via `-v .../data/datasets/push_bottle_demos:/tmp/push_bottle_demos:ro`
+# (read-only: the learner only ever reads this dataset, never writes to it).
+dataset:
+  repo_id: SSTC-AITeam/hilserl-push-bottle
+  root: /tmp/push_bottle_demos
+  video_backend: pyav
+
+policy:
+  type: sac
+  device: cuda
+  push_to_hub: false
+  use_torch_compile: false  # keep disabled -- avoid first-compile latency adding to an already cold-start-prone loop
+  online_steps: 300  # a few hundred, per plan -- first attempt at real (if short) training, not just plumbing
+  online_step_before_learning: 10  # start mixing in demo data almost immediately
+  online_buffer_capacity: 2000
+  offline_buffer_capacity: 2000
+  actor_learner_config:
+    learner_host: 127.0.0.1
+    learner_port: 50051
+
+output_dir: outputs/hilserl_push_bottle_fakehw_dataset_diag
+job_name: hilserl_push_bottle_fakehw_dataset_diag
+seed: 42
+wandb:
+  enable: false
