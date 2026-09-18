@@ -140,6 +140,21 @@ policy:
   device: cuda
   push_to_hub: false
   use_torch_compile: false  # keep disabled -- avoid first-compile latency adding to an already cold-start-prone loop
+  # SACPolicy.select_action() always stochastically samples from
+  # Normal(mean, std) before tanh-squashing -- there's no deterministic/
+  # "hold still" branch. Default policy_kwargs.std_max=10.0 means an
+  # untrained policy's sampled (pre-squash) actions are huge relative to
+  # the tanh range, so they saturate near +/-1 almost every tick, with a
+  # fresh independent random draw each 100ms -- this is what produced the
+  # "shook rapidly" symptom on occurrence #7. init_final=0.05 (unchanged,
+  # still lerobot's default) already keeps the MEAN action small/near-zero
+  # at init; lowering the sampling ceiling here keeps genuine SAC
+  # exploration (still stochastic, still learns) while bounding how
+  # extreme any single sampled action can be, so the untrained policy
+  # should sit much closer to that near-zero mean instead of swinging
+  # between extremes.
+  policy_kwargs:
+    std_max: 0.5
   online_steps: 300  # a few hundred, per plan -- first attempt at real (if short) training, not just plumbing
   online_step_before_learning: 10  # start mixing in demo data almost immediately
   online_buffer_capacity: 2000
