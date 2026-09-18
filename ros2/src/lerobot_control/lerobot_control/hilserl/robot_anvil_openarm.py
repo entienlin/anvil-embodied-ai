@@ -11,6 +11,7 @@ See the HIL-SERL plan for the full reasoning.
 import atexit
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -75,6 +76,23 @@ class AnvilOpenArmFollower(Robot):
     config_class = AnvilOpenArmFollowerConfig
     name = "anvil_openarm_follower"
 
+    # Liveness watchdog tuning -- see the docstring on
+    # self._liveness_observed_window in __init__ for why this exists.
+    # Window size ~1s at this task's 10Hz control_frequency: every real
+    # fault occurrence so far has been near-instantaneous (all affected
+    # joints drop within ~2-7ms), so 1s of sustained "commanded but not
+    # moving" is a comfortable margin above any normal settle/latency
+    # jitter while still catching a real fault within one second of it
+    # happening, not many seconds later.
+    _LIVENESS_WINDOW_SIZE = 10
+    # rad; a commanded delta below this is "holding still on purpose",
+    # not a real move attempt, and shouldn't count toward the streak.
+    _LIVENESS_COMMAND_THRESHOLD_RAD = 0.01
+    # rad; the observed position's range (max-min) across the whole
+    # window must stay below this for the watchdog to consider the arm
+    # "not actually moving" despite sustained real commands.
+    _LIVENESS_STILL_THRESHOLD_RAD = 0.002
+
     def __init__(self, config: AnvilOpenArmFollowerConfig):
         super().__init__(config)
         self.config = config
@@ -124,6 +142,23 @@ class AnvilOpenArmFollower(Robot):
         # anomaly, not normal jitter.
         self._last_publish_time: float | None = None
         self._publish_gap_warn_threshold_s = 0.25
+
+        # Liveness watchdog: the recurring "follower dead" fault (8
+        # real-hardware occurrences and counting) has no ROS2-visible
+        # signature at all -- controller_manager reports the controller
+        # as healthy/active throughout, and our own control loop keeps
+        # publishing and logging normally, because nothing in this
+        # pipeline ever checks whether the arm actually MOVED in response.
+        # Confirmed directly on a real run: the arm died 14s into an
+        # episode that still logged a clean "Episode reward: 0.0"
+        # completion, because the actor has no feedback path for this at
+        # all. This tracks commanded-vs-observed motion over a rolling
+        # window and raises if we've been commanding real movement for a
+        # sustained period with zero observed response -- turning a
+        # silent, undetectable failure into a loud one, independent of
+        # whatever the underlying root cause turns out to be.
+        self._liveness_observed_window: deque = deque(maxlen=self._LIVENESS_WINDOW_SIZE)
+        self._liveness_commanded_streak = 0
 
         # Real hardware finding: reset()'s blocking sleep (already patched
         # in patches.py) was NOT the only source of multi-second publish
@@ -350,6 +385,43 @@ class AnvilOpenArmFollower(Robot):
 
         return obs
 
+    def _check_liveness(self, commanded_rad: np.ndarray, observed_rad: np.ndarray | None) -> None:
+        """Raise if we've been commanding real movement for a full window
+        with zero observed response -- see the watchdog docstring in
+        __init__ for why this exists and what it's protecting against.
+        """
+        if observed_rad is None:
+            # Can't evaluate this tick (joint state incomplete) -- don't
+            # let a transient observation gap reset a streak in progress.
+            return
+
+        commanded_delta = float(np.max(np.abs(commanded_rad - observed_rad)))
+        if commanded_delta > self._LIVENESS_COMMAND_THRESHOLD_RAD:
+            self._liveness_commanded_streak += 1
+        else:
+            self._liveness_commanded_streak = 0
+
+        self._liveness_observed_window.append(observed_rad)
+
+        if (
+            self._liveness_commanded_streak < self._LIVENESS_WINDOW_SIZE
+            or len(self._liveness_observed_window) < self._LIVENESS_WINDOW_SIZE
+        ):
+            return
+
+        observed_stack = np.stack(self._liveness_observed_window)
+        observed_range = float(np.max(observed_stack.max(axis=0) - observed_stack.min(axis=0)))
+        if observed_range < self._LIVENESS_STILL_THRESHOLD_RAD:
+            raise RuntimeError(
+                f"AnvilOpenArmFollower: liveness watchdog tripped -- commanded "
+                f"real movement (>{self._LIVENESS_COMMAND_THRESHOLD_RAD} rad delta) "
+                f"for {self._LIVENESS_WINDOW_SIZE} consecutive ticks but observed "
+                f"joint position only moved {observed_range:.5f} rad over that same "
+                f"window (threshold {self._LIVENESS_STILL_THRESHOLD_RAD} rad). The "
+                "arm appears unresponsive -- see the recurring 'follower dead' "
+                "fault investigation in the HIL-SERL plan."
+            )
+
     def send_action(self, action: dict) -> dict:
         if not self._is_connected:
             raise RuntimeError("AnvilOpenArmFollower is not connected")
@@ -365,6 +437,8 @@ class AnvilOpenArmFollower(Robot):
             current_rad = np.array([name_to_pos[j] for j in self.joint_names], dtype=np.float64)
 
         clamped_rad = self._action_limiter.process(target_rad, current_positions=current_rad)
+
+        self._check_liveness(clamped_rad, current_rad)
 
         if self.gripper_joint_name not in name_to_pos:
             raise RuntimeError(
