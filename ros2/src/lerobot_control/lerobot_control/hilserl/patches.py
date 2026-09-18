@@ -253,19 +253,23 @@ def patch_robot_env_reset_to_keep_publishing() -> None:
     command arrives within some threshold, and this reset design
     guarantees exactly that gap on every single episode boundary.
 
-    Fix: replace the blocking sleep with a loop that keeps republishing a
-    "hold at current position" command every 100ms for the same total
-    duration, so the command topic is never actually silent. Doesn't
-    change reset()'s real behavior or timing (still waits reset_time_s
-    before returning; still does the optional reset_follower_position()
-    first if reset_pose is configured) -- only removes the silent gap.
+    Superseded for real hardware by
+    `patch_robot_env_reset_to_home_via_arms_resetter()` below, which does
+    real active homing (never silent) instead of a hold-loop and closes a
+    second, more serious gap this fix alone didn't: the old hold-in-place
+    approach never touched controller state or intervention bookkeeping,
+    so it structurally left the untrained policy in sole, unsupervised
+    control of the real arm for the entire `reset_time_s` window after
+    every episode boundary (confirmed as the proximate cause of a real
+    fault). Kept here, still applied first, as the fallback for any run
+    without a registered `AnvilOpenArmLeader` (e.g. Stage 3's stock
+    `keyboard_ee` fake-hardware dry run) -- the homing patch below
+    delegates to this one's own hold-loop when no leader is registered.
     """
     from lerobot.rl.gym_manipulator import RobotEnv
 
     if getattr(RobotEnv, "_anvil_reset_keepalive_patch_applied", False):
         return
-
-    import time as _time
 
     import gymnasium as gym
     import numpy as np
@@ -273,7 +277,9 @@ def patch_robot_env_reset_to_keep_publishing() -> None:
     from lerobot.teleoperators.utils import TeleopEvents
     from lerobot.utils.robot_utils import precise_sleep
 
-    def _patched_reset(self, *, seed=None, options=None):
+    def _hold_in_place_reset(self, *, seed=None, options=None):
+        import time as _time
+
         start_time = _time.perf_counter()
         if self.reset_pose is not None:
             log_say("Reset the environment.", play_sounds=True)
@@ -294,8 +300,79 @@ def patch_robot_env_reset_to_keep_publishing() -> None:
         self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
         return obs, {TeleopEvents.IS_INTERVENTION: False}
 
-    RobotEnv.reset = _patched_reset
+    RobotEnv.reset = _hold_in_place_reset
+    RobotEnv._anvil_hold_in_place_reset = _hold_in_place_reset
     RobotEnv._anvil_reset_keepalive_patch_applied = True
+
+
+def patch_robot_env_reset_to_home_via_arms_resetter() -> None:
+    """Real hardware finding, ninth "follower dead" occurrence: the old
+    hold-in-place reset (see `patch_robot_env_reset_to_keep_publishing()`
+    above) kept the command topic alive, but never touched controller
+    state or intervention bookkeeping -- so it structurally left the
+    untrained policy in sole, unsupervised control of the real arm for
+    `reset_time_s` after EVERY episode boundary, regardless of what the
+    human did with the intervention key (RobotEnv.reset() never calls
+    into the teleop device at all). Confirmed as the proximate cause of a
+    real fault: the human's own space-bar toggle can't re-engage
+    teleop_controller until the NEXT real step calls get_action() again,
+    which never happens during reset().
+
+    Fix: replace the hold-loop with a real home-position reset via the
+    devbox's /arms_resetter/reset (ArmsResetterClient), orchestrated by
+    AnvilOpenArmLeader.perform_episode_reset_and_wait() -- releases
+    follower_r_forward_position_controller, waits for a real "homed"
+    completion (not just the service ack), then explicitly reestablishes
+    "policy drives by default" as the clean per-episode baseline (the
+    same thing connect() already does once at session start, just
+    repeated at every episode boundary now). This is also what finally
+    makes real mixed-control HIL-SERL sessions possible: space becomes a
+    per-episode choice anchored to a real, observable "homed" event
+    instead of an ambiguous timer.
+
+    Requires `patch_robot_env_reset_to_keep_publishing()` to already be
+    applied (defines the hold-in-place fallback this delegates to when no
+    AnvilOpenArmLeader is registered -- e.g. Stage 3's stock keyboard_ee
+    fake-hardware dry run, which has no arms_resetter equivalent to call).
+    """
+    from lerobot.rl.gym_manipulator import RobotEnv
+
+    if not getattr(RobotEnv, "_anvil_reset_keepalive_patch_applied", False):
+        raise RuntimeError(
+            "patch_robot_env_reset_to_home_via_arms_resetter() requires "
+            "patch_robot_env_reset_to_keep_publishing() to be applied first "
+            "(defines the hold-in-place fallback) -- call apply_all_patches() "
+            "rather than this function directly."
+        )
+    if getattr(RobotEnv, "_anvil_reset_home_patch_applied", False):
+        return
+
+    from lerobot.teleoperators.utils import TeleopEvents
+
+    from .teleop_anvil_openarm_leader import get_registered_leader
+
+    hold_in_place_reset = RobotEnv._anvil_hold_in_place_reset
+
+    def _patched_reset(self, *, seed=None, options=None):
+        leader = get_registered_leader()
+        if leader is None:
+            # No AnvilOpenArmLeader in this process (e.g. Stage 3's stock
+            # keyboard_ee) -- arms_resetter isn't applicable, fall back.
+            return hold_in_place_reset(self, seed=seed, options=options)
+
+        leader.perform_episode_reset_and_wait(timeout_s=self.reset_time_s)
+
+        import gymnasium as gym
+
+        gym.Env.reset(self, seed=seed, options=options)
+        self.current_step = 0
+        self.episode_data = None
+        obs = self._get_observation()
+        self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
+        return obs, {TeleopEvents.IS_INTERVENTION: False}
+
+    RobotEnv.reset = _patched_reset
+    RobotEnv._anvil_reset_home_patch_applied = True
 
 
 def apply_all_patches() -> None:
@@ -318,6 +395,7 @@ def apply_all_patches() -> None:
     patch_ee_bounds_and_safety_to_clamp_not_crash()
     patch_inverse_kinematics_to_always_reseed_from_real_joints()
     patch_robot_env_reset_to_keep_publishing()
+    patch_robot_env_reset_to_home_via_arms_resetter()
     patch_train_pipeline_config_validate_for_optional_dataset()
 
 

@@ -34,8 +34,21 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
 
+from .arms_resetter_client import ArmsResetterClient
 from .keyboard_intervention import KeyboardIntervention
 from .switch_service_client import SwitchServiceClient
+
+# Module-level registry so the reset patch (which only has access to
+# RobotEnv's self.robot, not self.teleop -- RobotEnv.__init__ never
+# stores the teleoperator, gym_manipulator.py wires it in separately via
+# make_processors()) can reach the one AnvilOpenArmLeader instance in this
+# process to trigger the post-homing baseline handoff. Set at the end of
+# connect(), cleared at the start of disconnect() -- see both for why.
+_registered_leader: "AnvilOpenArmLeader | None" = None
+
+
+def get_registered_leader() -> "AnvilOpenArmLeader | None":
+    return _registered_leader
 
 
 @TeleoperatorConfig.register_subclass("anvil_openarm_leader")
@@ -99,6 +112,7 @@ class AnvilOpenArmLeader(Teleoperator):
 
         self._keyboard = KeyboardIntervention()
         self._switch_client: SwitchServiceClient | None = None
+        self._arms_resetter: ArmsResetterClient | None = None
         self._was_intervening = False
         self._leader_ee_ref: np.ndarray | None = None  # reset each time intervention (re)starts
         self._pending_switch_retries = 0  # see get_action()'s switch-failure handling
@@ -168,6 +182,13 @@ class AnvilOpenArmLeader(Teleoperator):
                 "unproven as of plan-writing time; see the plan's risk list.)"
             )
 
+        self._arms_resetter = ArmsResetterClient(self._node)
+        if not self._arms_resetter.wait_for_service(timeout_s=10.0):
+            raise RuntimeError(
+                "AnvilOpenArmLeader: /arms_resetter/reset service not available "
+                "after 10s -- is the devbox's arms_resetter_node running?"
+            )
+
         self._spin_stop.clear()
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin_thread.start()
@@ -221,6 +242,8 @@ class AnvilOpenArmLeader(Teleoperator):
         deadline = time.monotonic() + self.config.obs_timeout_s * 3
         while time.monotonic() < deadline:
             if self._has_leader_joint_data():
+                global _registered_leader
+                _registered_leader = self
                 return
             time.sleep(0.05)
         raise RuntimeError(
@@ -228,6 +251,44 @@ class AnvilOpenArmLeader(Teleoperator):
             f"{self.config.joint_state_topic} within {self.config.obs_timeout_s * 3}s "
             "-- is the devbox in a mode with leader hardware loaded?"
         )
+
+    def perform_episode_reset_and_wait(self, timeout_s: float = 15.0) -> None:
+        """Real home-position episode reset, replacing the old
+        hold-in-place approach -- called from the patched RobotEnv.reset()
+        (patches.py) via get_registered_leader(), since RobotEnv only has
+        self.robot, not self.teleop.
+
+        Sequence: (1) release follower_r_forward_position_controller --
+        the resetter has zero awareness of it and fails safe (no motion)
+        if it's still claiming the interfaces the resetter's JTC needs;
+        (2) call the resetter and wait for a real "homed"/"failed"
+        completion (the service ack alone is not a completion signal);
+        (3) on success, reestablish the same "policy drives by default"
+        baseline connect() establishes at session start -- this is the
+        actual fix for the structural gap where every episode boundary
+        used to leave an unsupervised window for the (still-training)
+        policy. On failure, deliberately do NOT reestablish that baseline
+        -- leave the arm on teleop_controller (already there from step 1,
+        a safe hold) and raise loudly rather than silently continuing in
+        an unknown state.
+        """
+        self._switch_client.switch_to_teleop()
+
+        if not self._arms_resetter.reset_and_wait(timeout_s=timeout_s):
+            raise RuntimeError(
+                "AnvilOpenArmLeader: episode reset failed -- arms_resetter did not "
+                "report 'homed' (see its own error log above for the specific "
+                "reason). Leaving the arm on teleop_controller rather than "
+                "re-engaging the policy in an unknown state."
+            )
+
+        if not self._switch_client.switch_to_policy():
+            raise RuntimeError(
+                "AnvilOpenArmLeader: homing succeeded but re-establishing the "
+                "policy-controlled baseline afterward failed."
+            )
+        self._was_intervening = False
+        self._leader_ee_ref = None
 
     def _spin_loop(self) -> None:
         while not self._spin_stop.is_set() and rclpy.ok():
@@ -335,21 +396,23 @@ class AnvilOpenArmLeader(Teleoperator):
     def get_teleop_events(self) -> dict:
         labels = self._keyboard.consume_episode_labels()
 
-        # Real hardware finding (Stage 5): pressing 's'/'f' ends the
-        # episode independently of the space-bar intervention toggle. If
-        # the user presses one WHILE STILL INTERVENING (without giving
-        # back via space first), the follower was left held by
-        # teleop_controller through the reset wait and beyond -- observed
-        # as the arm going "dead"/unresponsive. Originally fixed only at
-        # disconnect() (end of the whole script), but multi-episode
-        # collection hits this same episode-boundary reset on EVERY
-        # episode, not just the last one -- force the give-back here too,
-        # the moment success/failure is detected, rather than relying on
-        # keypress ordering being remembered correctly across many
-        # repeated episodes. Safe/idempotent: _handle_switch_edge is a
-        # no-op if we already gave back properly via space.
-        if (labels["success"] or labels["failure"]) and self._was_intervening:
-            self._handle_switch_edge(self._switch_client.switch_to_policy, target_was_intervening=False)
+        # NOTE: this used to force switch_to_policy() here on every
+        # success/failure label, to avoid leaving the follower stuck on
+        # teleop_controller through a reset (Stage 5 finding). Removed --
+        # it's now redundant with (and was actively harmful alongside) the
+        # real home-position reset: ArmsResetterClient.reset_and_wait()
+        # unconditionally releases follower_r_forward_position_controller
+        # before every homing call regardless of how the episode ended,
+        # and the post-homing baseline handoff (see
+        # _on_reset_homed()/connect()) is what now establishes a clean,
+        # known "policy drives by default" state every episode -- a single
+        # source of truth instead of two independent, easily-desynced
+        # give-back paths. Confirmed via a real-hardware incident: a user
+        # instructed to "press space again" after this fired unknowingly
+        # toggled the keyboard's raw intervention flag OFF (this code path
+        # never touched it, only internal bookkeeping), handing the
+        # untrained policy uncontested control -- removing this path
+        # removes that whole failure class.
 
         return {
             TeleopEvents.IS_INTERVENTION: self._keyboard.is_intervention,
@@ -365,6 +428,10 @@ class AnvilOpenArmLeader(Teleoperator):
     def disconnect(self) -> None:
         if not self._is_connected:
             return
+
+        global _registered_leader
+        if _registered_leader is self:
+            _registered_leader = None
 
         # Real hardware finding (Stage 5): pressing 's'/'f' (success/failure)
         # ends the episode and, for gym_manipulator.py's num_episodes_to_record

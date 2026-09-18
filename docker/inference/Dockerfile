@@ -124,8 +124,14 @@ RUN if echo "${LEROBOT_EXTRAS}" | tr ',' '\n' | grep -qx 'groot'; then \
             "${GROOT_FLASH_ATTN_WHEEL}"; \
     fi
 
-# Copy ROS2 package (changes often → late layer)
+# Copy ROS2 packages (change often → late layer). anvil_msgs is a local,
+# minimal reproduction of the two devbox anvil_msgs interfaces the
+# HIL-SERL bridge needs (ArmsResetterClient) -- see
+# ros2/src/anvil_msgs/package.xml for why an exact field-level
+# reproduction gives real cross-machine type-hash interop, not just a
+# lookalike package.
 COPY ros2/src/lerobot_control /workspace/src/lerobot_control
+COPY ros2/src/anvil_msgs /workspace/src/anvil_msgs
 
 # Copy configs (lerobot_control + cyclonedds)
 COPY configs /workspace/configs

@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>anvil_msgs</name>
+  <version>0.0.1</version>
+  <description>
+    Local, minimal reproduction of the two anvil_msgs interfaces this
+    project's HIL-SERL bridge needs (ResetArms.srv, ArmsResetStatus.msg),
+    for cross-machine ROS2 communication with the devbox's real
+    anvil_msgs package. Field content extracted verbatim from the
+    devbox's own built image (docker cp from
+    /workspace/install/anvil_msgs/share/anvil_msgs/) -- NOT the full
+    anvil_msgs package, which also defines unrelated message types
+    (MotorStatus, HardwareState, CanMotorMetric, etc.) this project
+    doesn't use. ROS2's type hash is computed from the IDL-level
+    definition (type + field name + order), not build metadata, so an
+    exact reproduction of just these two files is sufficient for real
+    interop with the devbox's build, not merely a lookalike.
+  </description>
+  <maintainer email="noreply@anthropic.com">anvil-embodied-ai</maintainer>
+  <license>proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
