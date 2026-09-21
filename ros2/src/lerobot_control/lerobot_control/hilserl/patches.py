@@ -402,6 +402,38 @@ def apply_all_patches() -> None:
     patch_robot_env_reset_to_home_via_arms_resetter()
     patch_train_pipeline_config_validate_for_optional_dataset()
     patch_learner_progress_visibility()
+    patch_learner_stop_at_online_steps()
+
+
+def patch_learner_stop_at_online_steps() -> None:
+    """lerobot's learner loop is `while True` with no exit on online_steps: it
+    keeps re-training on the same finite buffer forever after the budget
+    (seen 2026-09-21: 4000+ steps for a 1000-step budget). Once the checkpoint
+    at optimization_step == online_steps is written, raise SIGINT so lerobot's
+    normal shutdown path runs (same as pressing Ctrl+C, after saving)."""
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_stop_patched", False):
+        return
+    learner_mod._anvil_stop_patched = True
+
+    import os as _os
+    import signal as _signal
+
+    orig_save = learner_mod.save_training_checkpoint
+
+    def _save(*a, **kw):
+        result = orig_save(*a, **kw)
+        step, budget = kw.get("optimization_step"), kw.get("online_steps")
+        if step is not None and budget is not None and step == budget:
+            print(f"[LEARNER-DBG] reached optimization step {step} == online_steps; "
+                  "checkpoint saved, shutting down.", flush=True)
+            _os.kill(_os.getpid(), _signal.SIGINT)
+        return result
+
+    learner_mod.save_training_checkpoint = _save
 
 
 def patch_learner_progress_visibility() -> None:
