@@ -422,6 +422,19 @@ class AnvilOpenArmFollower(Robot):
             # let a transient observation gap reset a streak in progress.
             return
 
+        # While a human is intervening, teleop_controller drives the arm and
+        # follower_r_forward_position_controller is INACTIVE, so our commands
+        # are ignored by design -- a still leader arm then looks exactly like
+        # "commanded movement, no response". Confirmed false positive: the
+        # actor died ~8s after the user pressed space (2026-09-21 07:13).
+        from lerobot_control.hilserl.teleop_anvil_openarm_leader import get_registered_leader
+
+        leader = get_registered_leader()
+        if leader is not None and (leader._was_intervening or leader._keyboard.is_intervention):
+            self._liveness_commanded_streak = 0
+            self._liveness_observed_window.clear()
+            return
+
         commanded_delta = float(np.max(np.abs(commanded_rad - observed_rad)))
         if commanded_delta > self._LIVENESS_COMMAND_THRESHOLD_RAD:
             self._liveness_commanded_streak += 1
