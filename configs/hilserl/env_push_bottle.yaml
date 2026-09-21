@@ -28,6 +28,7 @@ env:
       wrist_r: /cam_wrist_r/image_raw/compressed
     control_frequency: 10.0
     max_position_delta: 0.05  # per-tick clamp around MEASURED pose; 0.30 allowed 0.6 rad reversals in 100ms (fault #11 trace)
+    max_command_step_rad: 0.03  # consecutive published commands may differ by at most this (kills policy wobble)
     obs_timeout_s: 2.0
 
   teleop:

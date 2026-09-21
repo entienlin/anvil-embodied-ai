@@ -51,6 +51,11 @@ class AnvilOpenArmFollowerConfig(RobotConfig):
     # safety.max_position_delta default. Second line of defense alongside
     # HIL-SERL's own end_effector_bounds, not a replacement for it.
     max_position_delta: float = 0.30
+    # Per-tick change allowed between consecutive PUBLISHED commands. The
+    # max_position_delta clamp above is around the MEASURED pose, so it can't
+    # stop consecutive commands alternating up/down by ~0.2 rad (BC-policy
+    # j6 wobble, 2026-09-21 trace). None disables.
+    max_command_step_rad: float | None = 0.03
     obs_timeout_s: float = 2.0
 
 
@@ -477,6 +482,14 @@ class AnvilOpenArmFollower(Robot):
             current_rad = np.array([name_to_pos[j] for j in self.joint_names], dtype=np.float64)
 
         clamped_rad = self._action_limiter.process(target_rad, current_positions=current_rad)
+
+        step = self.config.max_command_step_rad
+        if step is not None:
+            with self._publish_lock:
+                last = self._last_sent_msg
+            if last is not None:
+                last_arm = np.asarray(last.data[: len(clamped_rad)], dtype=np.float64)
+                clamped_rad = last_arm + np.clip(clamped_rad - last_arm, -step, step)
 
         self._check_liveness(clamped_rad, current_rad)
 
