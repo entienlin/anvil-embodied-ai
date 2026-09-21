@@ -401,6 +401,85 @@ def apply_all_patches() -> None:
     patch_robot_env_reset_to_keep_publishing()
     patch_robot_env_reset_to_home_via_arms_resetter()
     patch_train_pipeline_config_validate_for_optional_dataset()
+    patch_learner_progress_visibility()
+
+
+def patch_learner_progress_visibility() -> None:
+    """Learner-side gRPC/training threads' logging.info() output never showed
+    up in the terminal (2026-09-21: two 1000-step runs looked identical to a
+    stuck learner). Print (flush) transition arrivals, parameter pushes and
+    training progress so a silent learner can be told apart from a working one.
+    No-op if lerobot.rl.learner isn't importable (e.g. actor process)."""
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_progress_patched", False):
+        return
+    learner_mod._anvil_progress_patched = True
+
+    import time as _time
+
+    orig_process = learner_mod.process_transitions
+    state = {"n": 0, "t": 0.0}
+
+    def _process(transition_queue, replay_buffer, *a, **kw):
+        before = len(replay_buffer)
+        orig_process(transition_queue, replay_buffer, *a, **kw)
+        after = len(replay_buffer)
+        if after != before:
+            print(f"[LEARNER-DBG] replay buffer {before} -> {after}", flush=True)
+        now = _time.time()
+        if now - state["t"] > 15.0:
+            state["t"] = now
+            print(f"[LEARNER-DBG] alive: online buffer={after}", flush=True)
+
+    learner_mod.process_transitions = _process
+
+    orig_push = learner_mod.push_actor_policy_to_queue
+
+    def _push(parameters_queue, policy):
+        state["n"] += 1
+        print(f"[LEARNER-DBG] parameters pushed to queue (#{state['n']})", flush=True)
+        return orig_push(parameters_queue, policy)
+
+    learner_mod.push_actor_policy_to_queue = _push
+
+    # Which gRPC streams did the actor actually open? (their own logging.info
+    # lines are invisible in the terminal -- see docstring above)
+    try:
+        from lerobot.rl.learner_service import LearnerService
+
+        for name in ("StreamParameters", "SendTransitions", "SendInteractions", "Ready"):
+            orig = getattr(LearnerService, name, None)
+            if orig is None:
+                continue
+
+            def _wrap(orig=orig, name=name):
+                def inner(self, *a, **kw):
+                    print(f"[LEARNER-DBG] gRPC {name} opened by actor", flush=True)
+                    return orig(self, *a, **kw)
+
+                return inner
+
+            setattr(LearnerService, name, _wrap())
+    except Exception as e:  # noqa: BLE001
+        print(f"[LEARNER-DBG] could not wrap LearnerService: {e}", flush=True)
+
+    # Actor side is patched from the actor entrypoint via the same function
+    # (learner import succeeds there too), so instrument transition sends here.
+    try:
+        import lerobot.rl.actor as actor_mod
+
+        orig_push_t = actor_mod.push_transitions_to_transport_queue
+
+        def _push_t(transitions, transitions_queue):
+            print(f"[ACTOR-DBG] queueing {len(transitions)} transitions for the learner", flush=True)
+            return orig_push_t(transitions, transitions_queue)
+
+        actor_mod.push_transitions_to_transport_queue = _push_t
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def patch_train_pipeline_config_validate_for_optional_dataset() -> None:
