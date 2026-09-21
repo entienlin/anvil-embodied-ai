@@ -144,8 +144,7 @@ dataset:
 policy:
   type: sac
   # BC-pretrained actor (hilserl_bc_pretrain, 5 demos, 1500 steps, mse 0.14->0.005). Baked into the image so actor+learner both find it.
-  # Chained: RL-updated policy from the 2026-09-21 09:5x run (learner optimization step 1000, started from bc_pretrained).
-  pretrained_path: /workspace/configs/hilserl/rl_ckpt_0921_step1000
+  pretrained_path: /workspace/configs/hilserl/bc_pretrained
   device: cuda
   push_to_hub: false
   use_torch_compile: false  # keep disabled -- avoid first-compile latency adding to an already cold-start-prone loop
@@ -166,6 +165,9 @@ policy:
     std_max: 0.5
   online_steps: 1000  # ~10 episodes; up from 300 (first BC-started run)
   online_step_before_learning: 10  # start mixing in demo data almost immediately
+  # SAC entropy bonus at the default temperature_init=1.0 blew the BC actor's std back up to the 0.5 cap within 250 steps
+  # (sampling std 0.02 -> 0.5, error vs demos 0.045 -> 0.2 on checkpoints 250/500/1000). Start with a small temperature.
+  temperature_init: 0.01
   online_buffer_capacity: 2000
   offline_buffer_capacity: 2000
   actor_learner_config:
