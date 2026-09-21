@@ -110,9 +110,16 @@ class KeyboardIntervention:
         """Clear the space-bar toggle back to "not intervening". The toggle
         is otherwise persistent across episodes (s/f never touch it), so
         without this a human who intervened in one episode would silently
-        start the next one already in control."""
+        start the next one already in control.
+
+        Also drops any s/f/r pressed during the homing window: RobotEnv.reset()
+        never reads them, so they would otherwise latch and label the FIRST
+        step of the next episode (seen 2026-09-21: 1-step "success" episode)."""
         with self._lock:
             self._is_intervention = False
+            self._success = False
+            self._failure = False
+            self._rerecord = False
 
     def consume_episode_labels(self) -> dict:
         """Read and clear the one-shot success/failure/rerecord flags."""
