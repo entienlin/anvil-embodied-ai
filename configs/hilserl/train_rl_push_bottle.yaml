@@ -163,7 +163,7 @@ policy:
   # between extremes.
   policy_kwargs:
     std_max: 0.5
-  online_steps: 300  # a few hundred, per plan -- first attempt at real (if short) training, not just plumbing
+  online_steps: 1000  # ~10 episodes; up from 300 (first BC-started run)
   online_step_before_learning: 10  # start mixing in demo data almost immediately
   online_buffer_capacity: 2000
   offline_buffer_capacity: 2000
@@ -174,5 +174,6 @@ policy:
 output_dir: outputs/hilserl_push_bottle
 job_name: hilserl_push_bottle
 seed: 42
+save_freq: 250  # intermediate checkpoints (counts optimization steps) so an early Ctrl+C does not lose everything
 wandb:
   enable: false
