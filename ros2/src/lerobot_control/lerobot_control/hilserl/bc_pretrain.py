@@ -56,7 +56,11 @@ def bc_pretrain(cfg) -> None:
     policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env)
     policy.train()
 
-    datasets = [LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, video_backend=cfg.dataset.video_backend)]
+    datasets = []
+    if os.environ.get("BC_SKIP_BASE") != "1":  # BC_SKIP_BASE=1: train ONLY on BC_EXTRA_DATASETS
+        datasets.append(
+            LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, video_backend=cfg.dataset.video_backend)
+        )
     # Optional extra human-driven data (e.g. the learner's saved replay-buffer
     # datasets, outputs/<run>/dataset), comma-separated container paths.
     for i, root in enumerate(p for p in os.environ.get("BC_EXTRA_DATASETS", "").split(",") if p):
