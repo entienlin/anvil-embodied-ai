@@ -289,6 +289,13 @@ class AnvilOpenArmLeader(Teleoperator):
             )
         self._was_intervening = False
         self._leader_ee_ref = None
+        # The keyboard toggle persists across episodes (s/f never touch
+        # it) -- clear it too, so every episode starts as "policy drives"
+        # and space is a fresh, deliberate per-episode choice. Without
+        # this, intervening once would silently carry into every later
+        # episode, and the raw flag would disagree with the reestablished
+        # baseline above.
+        self._keyboard.reset_intervention()
 
     def _spin_loop(self) -> None:
         while not self._spin_stop.is_set() and rclpy.ok():

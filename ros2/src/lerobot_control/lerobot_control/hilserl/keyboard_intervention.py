@@ -106,6 +106,14 @@ class KeyboardIntervention:
         with self._lock:
             return self._is_intervention
 
+    def reset_intervention(self) -> None:
+        """Clear the space-bar toggle back to "not intervening". The toggle
+        is otherwise persistent across episodes (s/f never touch it), so
+        without this a human who intervened in one episode would silently
+        start the next one already in control."""
+        with self._lock:
+            self._is_intervention = False
+
     def consume_episode_labels(self) -> dict:
         """Read and clear the one-shot success/failure/rerecord flags."""
         with self._lock:

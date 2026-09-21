@@ -166,6 +166,7 @@ def main() -> int:
     leader._arms_resetter = _StubResetter(ok=True)
     leader._was_intervening = True  # simulate mid-episode intervention state
     leader._leader_ee_ref = object()
+    leader._keyboard._is_intervention = True  # human intervened this episode
 
     leader.perform_episode_reset_and_wait(timeout_s=5.0)
 
@@ -184,8 +185,13 @@ def main() -> int:
     if leader._leader_ee_ref is not None:
         print("[FAIL] expected _leader_ee_ref cleared on success", flush=True)
         return 1
+    if leader._keyboard.is_intervention is not False:
+        print("[FAIL] expected the keyboard toggle cleared on success, so the next "
+              "episode starts as 'policy drives' instead of silently inheriting "
+              "the human's intervention", flush=True)
+        return 1
     print("[OK] success path: teleop released -> homed -> policy baseline reestablished, "
-          "state correctly reset", flush=True)
+          "state and keyboard toggle correctly reset", flush=True)
 
     print("[stage6f] perform_episode_reset_and_wait(): homing failure must raise, "
           "NOT reestablish the policy baseline...", flush=True)
@@ -194,6 +200,7 @@ def main() -> int:
     leader2._switch_client = _StubSwitchClient()
     leader2._arms_resetter = _StubResetter(ok=False)
     leader2._was_intervening = True
+    leader2._keyboard._is_intervention = True
 
     try:
         leader2.perform_episode_reset_and_wait(timeout_s=5.0)
@@ -207,6 +214,9 @@ def main() -> int:
         return 1
     if leader2._was_intervening is not True:
         print("[FAIL] _was_intervening must be left unchanged on failure, not silently reset", flush=True)
+        return 1
+    if leader2._keyboard.is_intervention is not True:
+        print("[FAIL] keyboard toggle must be left alone on a failed reset", flush=True)
         return 1
     print("[OK] correctly left the arm on teleop_controller, did not silently continue", flush=True)
 

@@ -78,7 +78,7 @@ env:
                                           # teleop reset for v1, a known accepted limitation (see plan)
       # Now doubles as ArmsResetterClient.reset_and_wait()'s real timeout
       # (patches.py's patch_robot_env_reset_to_home_via_arms_resetter) --
-      # devbox-observed real homing takes ~4-5s typically, 18s gives a
+      # devbox-observed real re-homing took ~3.2s, 18s gives a
       # comfortable margin without waiting forever if homing genuinely fails.
       reset_time_s: 18.0
       control_time_s: 20.0  # generous for a "5-10s" task per HIL-SERL's own guidance; tighten once tuned
