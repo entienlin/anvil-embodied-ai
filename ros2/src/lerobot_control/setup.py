@@ -39,6 +39,7 @@ setup(
             "hilserl_verify_arms_resetter = lerobot_control.hilserl.verify_arms_resetter:main",
             "hilserl_actor = lerobot_control.hilserl.run_actor:main",
             "hilserl_learner = lerobot_control.hilserl.run_learner:main",
+            "hilserl_bc_pretrain = lerobot_control.hilserl.bc_pretrain:main",
         ],
     },
 )

@@ -142,6 +142,8 @@ dataset:
 
 policy:
   type: sac
+  # BC-pretrained actor (hilserl_bc_pretrain, 5 demos, 1500 steps, mse 0.14->0.005). Baked into the image so actor+learner both find it.
+  pretrained_path: /workspace/configs/hilserl/bc_pretrained
   device: cuda
   push_to_hub: false
   use_torch_compile: false  # keep disabled -- avoid first-compile latency adding to an already cold-start-prone loop
