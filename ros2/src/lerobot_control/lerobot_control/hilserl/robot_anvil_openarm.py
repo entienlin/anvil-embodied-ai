@@ -330,6 +330,33 @@ class AnvilOpenArmFollower(Robot):
             self._last_sent_msg = hold_msg
             self._last_publish_time = time.monotonic()
 
+    def clear_heartbeat(self) -> None:
+        """Stop republishing any remembered command. Called at the start
+        of a homing reset: the arm is about to be moved by the devbox's
+        arms_resetter, so whatever was last commanded is about to become
+        stale, and must never be republished afterwards."""
+        with self._publish_lock:
+            self._last_sent_msg = None
+
+    def reseed_heartbeat_after_reset(self) -> None:
+        """Re-seed the heartbeat with the arm's ACTUAL post-homing pose.
+
+        Real hardware finding (first full session with homing): the
+        heartbeat kept republishing the last pre-reset command (the arm's
+        pose at the end of the previous episode) throughout homing and
+        right through re-activation of follower_r_forward_position_controller
+        -- overwriting the one bumpless home-position message
+        switch_to_policy() publishes, and commanding a large step from
+        home back toward the old pose at high gain the instant the
+        controller came up. The arm stopped responding within ~1.5s. Must
+        run after homing completes and BEFORE the policy controller is
+        re-activated. If the current pose can't be read, the heartbeat is
+        left empty (silent) rather than stale -- silence is safe, a stale
+        target is not.
+        """
+        self.clear_heartbeat()
+        self._seed_heartbeat_from_current_position()
+
     def _on_joint_state(self, msg: JointState) -> None:
         self._obs_manager.update_joint_state(msg)
 

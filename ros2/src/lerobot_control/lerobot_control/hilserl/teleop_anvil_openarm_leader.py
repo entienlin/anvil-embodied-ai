@@ -252,7 +252,12 @@ class AnvilOpenArmLeader(Teleoperator):
             "-- is the devbox in a mode with leader hardware loaded?"
         )
 
-    def perform_episode_reset_and_wait(self, timeout_s: float = 15.0) -> None:
+    def perform_episode_reset_and_wait(
+        self,
+        timeout_s: float = 15.0,
+        before_homing=None,
+        after_homed=None,
+    ) -> None:
         """Real home-position episode reset, replacing the old
         hold-in-place approach -- called from the patched RobotEnv.reset()
         (patches.py) via get_registered_leader(), since RobotEnv only has
@@ -271,7 +276,18 @@ class AnvilOpenArmLeader(Teleoperator):
         -- leave the arm on teleop_controller (already there from step 1,
         a safe hold) and raise loudly rather than silently continuing in
         an unknown state.
+
+        `before_homing` runs first, before anything moves; `after_homed`
+        runs after "homed" is confirmed and BEFORE the policy controller is
+        re-activated. The reset patch uses them to clear and then re-seed
+        the follower's heartbeat: without that, the heartbeat keeps
+        republishing the last pre-reset command and overwrites the bumpless
+        home-pose message at re-activation, commanding a large step from
+        home back toward the old pose (confirmed on real hardware).
         """
+        if before_homing is not None:
+            before_homing()
+
         self._switch_client.switch_to_teleop()
 
         if not self._arms_resetter.reset_and_wait(timeout_s=timeout_s):
@@ -281,6 +297,9 @@ class AnvilOpenArmLeader(Teleoperator):
                 "reason). Leaving the arm on teleop_controller rather than "
                 "re-engaging the policy in an unknown state."
             )
+
+        if after_homed is not None:
+            after_homed()
 
         if not self._switch_client.switch_to_policy():
             raise RuntimeError(

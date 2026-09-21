@@ -360,7 +360,11 @@ def patch_robot_env_reset_to_home_via_arms_resetter() -> None:
             # keyboard_ee) -- arms_resetter isn't applicable, fall back.
             return hold_in_place_reset(self, seed=seed, options=options)
 
-        leader.perform_episode_reset_and_wait(timeout_s=self.reset_time_s)
+        leader.perform_episode_reset_and_wait(
+            timeout_s=self.reset_time_s,
+            before_homing=self.robot.clear_heartbeat,
+            after_homed=self.robot.reseed_heartbeat_after_reset,
+        )
 
         import gymnasium as gym
 
