@@ -56,8 +56,31 @@ def bc_pretrain(cfg) -> None:
     policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env)
     policy.train()
 
-    ds = LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, video_backend=cfg.dataset.video_backend)
-    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0)
+    datasets = [LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, video_backend=cfg.dataset.video_backend)]
+    # Optional extra human-driven data (e.g. the learner's saved replay-buffer
+    # datasets, outputs/<run>/dataset), comma-separated container paths.
+    for i, root in enumerate(p for p in os.environ.get("BC_EXTRA_DATASETS", "").split(",") if p):
+        extra = LeRobotDataset(f"local/bc_extra_{i}", root=root, video_backend=cfg.dataset.video_backend)
+        print(f"[BC] extra dataset {root}: {extra.num_episodes} episodes, {len(extra)} frames", flush=True)
+        datasets.append(extra)
+
+    class _Keys(torch.utils.data.Dataset):
+        """Only the tensors BC uses -- the saved replay-buffer datasets carry
+        different extra columns, which breaks default_collate on a mixed batch."""
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __len__(self):
+            return len(self.inner)
+
+        def __getitem__(self, i):
+            item = self.inner[i]
+            return {k: item[k] for k in ("observation.state", "observation.images.wrist_r", "action")}
+
+    ds = torch.utils.data.ConcatDataset([_Keys(d) for d in datasets])
+    print(f"[BC] training on {len(ds)} frames total", flush=True)
+    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=4)
 
     params = list(policy.actor.parameters())
     opt = torch.optim.Adam(params, lr=3e-4)
