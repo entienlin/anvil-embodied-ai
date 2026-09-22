@@ -379,6 +379,138 @@ def patch_robot_env_reset_to_home_via_arms_resetter() -> None:
     RobotEnv._anvil_reset_home_patch_applied = True
 
 
+def patch_sac_deterministic_inference() -> None:
+    """SAC session (2026-09-22): user reported policy motion is "a bit
+    shaky (not smooth, but not the rapid shaky movement that leads to
+    limp)". Root cause: `SACPolicy.select_action()` (modeling_sac.py) is
+    the ONLY call site used for real-robot stepping (rl/actor.py's
+    act_with_policy() -> step_env_and_process_transition() ->
+    env.step(policy.select_action(...)); the learner's training path calls
+    policy.forward(batch, model="actor") -> compute_loss_actor() directly,
+    never select_action()) -- and it always does
+    `actions, _, _ = self.actor(batch, ...)`, i.e. a fresh independent
+    `dist.rsample()` draw every single 10Hz tick, discarding the 3rd
+    return value (`means`, the pre-tanh mean) it already computed for
+    free. Even with a small, held std (see patch_sac_freeze_temperature
+    below), per-tick resampling plus our own max_command_step_rad rate
+    limiter (robot_anvil_openarm.py) produces a small persistent
+    "creeping" jitter: the rate limiter only caps the derivative, it
+    doesn't stop each tick's target from moving toward a fresh random
+    point.
+
+    Fix: reuse the already-computed `means` and return
+    torch.tanh(means) -- the distribution's mode, per
+    TanhMultivariateNormalDiag.mode() (modeling_sac.py) confirms this
+    (no low/high rescale is passed when constructing the dist in
+    Policy.forward(), so mode() reduces to a plain tanh of the mean).
+    Minimal diff from upstream: reuses the SAME forward pass, only
+    changes which of the 3 already-computed outputs gets used.
+
+    Scope: ONLY this one real-robot call site is affected.
+    compute_loss_actor()/compute_loss_critic()/compute_loss_temperature()
+    (the learner's training math) still call self.actor(...) directly and
+    still use rsample()/log_prob() exactly as before -- SAC's training
+    objective is unchanged, only what gets published to the real motors.
+
+    Trade-off, stated plainly: this removes SAC's native action-space
+    exploration noise from real rollouts. Accepted for this project --
+    HIL-SERL's real exploration/correction signal here is the human
+    intervention pathway (untouched by this patch), not raw per-tick
+    Gaussian noise on real hardware, which is also the exact mechanism
+    behind every "shaky"/"limp" fault investigated earlier in this file's
+    sibling patches.
+    """
+    from lerobot.policies.sac.modeling_sac import SACPolicy
+
+    if getattr(SACPolicy, "_anvil_deterministic_patched", False):
+        return
+    SACPolicy._anvil_deterministic_patched = True
+
+    import torch
+
+    @torch.no_grad()
+    def _select_action_deterministic(self, batch):
+        observations_features = None
+        if self.shared_encoder and self.actor.encoder.has_images:
+            observations_features = self.actor.encoder.get_cached_image_features(batch)
+        _, _, means = self.actor(batch, observations_features)
+        actions = torch.tanh(means)
+        if self.config.num_discrete_actions is not None:
+            discrete_action_value = self.discrete_critic(batch, observations_features)
+            discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
+            actions = torch.cat([actions, discrete_action], dim=-1)
+        return actions
+
+    SACPolicy.select_action = _select_action_deterministic
+
+
+def patch_sac_freeze_temperature() -> None:
+    """SAC session (2026-09-22): user reported BC v1 and BC v4 (ResNet-10
+    encoder, 11 newest human-driven episodes -- measurably a better fit to
+    held-out demo frames, 0.21 vs ~0.30 mean error) "doesn't really have
+    significant difference" once trained through the real actor/learner
+    loop. Root cause, confirmed by reading modeling_sac.py/
+    configuration_sac.py directly: SAC auto-tunes temperature (log_alpha)
+    via a SEPARATE gradient descent (compute_loss_temperature():
+    `temperature_loss = (-log_alpha.exp() * (log_probs + target_entropy)).mean()`),
+    completely independent of temperature_init. target_entropy defaults to
+    -action_dim/2 (-1.5 for our 3-dim EE-delta action) when unset (our
+    config never sets it). For a narrow BC-like tanh-Gaussian, log_probs
+    (a continuous DENSITY, unbounded above as std shrinks) starts far
+    ABOVE that target the moment BC's tiny std (~0.005-0.02) loads, so the
+    gradient pushes log_alpha up hard regardless of its starting value --
+    confirmed empirically THIS SESSION: temperature_init=0.01 had ZERO
+    lasting effect, sampling std still hit the 0.5 std_max cap by
+    optimization step 250, identical to the temperature_init=1.0 run.
+    temperature_init only sets a starting point for a value that gets
+    auto-relearned away within a few hundred steps -- combined with
+    policy_parameters_push_frequency=4 (the learner pushes updated weights
+    to the actor roughly every 4 real seconds), a human essentially never
+    sees the raw BC checkpoint drive for more than a few seconds before
+    this auto-tuner has already started re-inflating its noise. Same
+    mechanism erases whatever quality difference exists between BC
+    checkpoints, every run, regardless of which BC you start from.
+
+    Fix: pin the temperature so temperature_init actually holds for the
+    whole run. NOT implemented as log_alpha.requires_grad_(False) -- that
+    breaks: compute_loss_temperature() already wraps its self.actor(...)
+    call in torch.no_grad() (so log_probs has requires_grad=False
+    independent of anything), so if log_alpha.requires_grad is ALSO
+    False, the resulting temperature_loss tensor has requires_grad=False
+    too, and loss_temperature.backward() (called unconditionally every
+    actor-update step in learner.py's loop) raises "element 0 of tensors
+    does not require grad and does not have a grad_fn". Real crash risk,
+    not hypothetical -- avoided here.
+
+    Correct implementation: multiply the ORIGINAL (unmodified) loss by
+    0.0 before returning it. log_alpha.requires_grad stays True
+    (untouched, default), and temperature_loss stays fully inside the
+    autograd graph (.backward() succeeds normally) -- but the gradient it
+    produces for log_alpha is now a real, valid all-zero tensor, never
+    None. Since this patch applies from policy construction, before any
+    optimizer step has ever run, Adam's internal moment estimates (m_t,
+    v_t) for log_alpha start at their standard zero initialization and
+    stay exactly zero forever under an always-zero gradient -- log_alpha
+    truly never moves from temperature_init.
+    optimizers["temperature"].step() still runs every call (harmless
+    no-op), and training_infos["loss_temperature"] correctly reports 0.0
+    as a diagnostic signal that this patch is active.
+    """
+    from lerobot.policies.sac.modeling_sac import SACPolicy
+
+    if getattr(SACPolicy, "_anvil_temperature_frozen_patched", False):
+        return
+    SACPolicy._anvil_temperature_frozen_patched = True
+
+    _orig_compute_loss_temperature = SACPolicy.compute_loss_temperature
+
+    def _compute_loss_temperature_frozen(self, observations, observation_features=None):
+        loss = _orig_compute_loss_temperature(self, observations, observation_features)
+        return loss * 0.0
+
+    SACPolicy.compute_loss_temperature = _compute_loss_temperature_frozen
+
+
 def apply_all_patches() -> None:
     """Single entry point for every runtime patch in this file. All of
     lerobot.rl.gym_manipulator's make_robot_env()/make_processors() pipeline
@@ -403,6 +535,8 @@ def apply_all_patches() -> None:
     patch_train_pipeline_config_validate_for_optional_dataset()
     patch_learner_progress_visibility()
     patch_learner_stop_at_online_steps()
+    patch_sac_deterministic_inference()
+    patch_sac_freeze_temperature()
 
 
 def patch_learner_stop_at_online_steps() -> None:
