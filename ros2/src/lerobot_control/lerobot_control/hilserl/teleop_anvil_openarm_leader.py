@@ -21,6 +21,7 @@ this entirely and matches how leader-follower teleop is meant to work.
 import atexit
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -317,8 +318,24 @@ class AnvilOpenArmLeader(Teleoperator):
         self._keyboard.reset_intervention()
 
     def _spin_loop(self) -> None:
+        """Mirrors AnvilOpenArmFollower._spin_loop's guard (see its
+        docstring) -- an uncaught exception in ANY callback on this
+        executor would otherwise silently kill this whole background
+        thread, starving joint_state updates with no crash/error visible
+        at the top level."""
         while not self._spin_stop.is_set() and rclpy.ok():
-            self._executor.spin_once(timeout_sec=0.05)
+            try:
+                self._executor.spin_once(timeout_sec=0.05)
+            except Exception:  # noqa: BLE001
+                # See robot_anvil_openarm.py's matching guard: rclpy's
+                # logger has no exc_info= kwarg, so format the traceback
+                # into the message string instead of passing it as a
+                # kwarg (which would itself raise and kill this thread).
+                self._node.get_logger().error(
+                    "AnvilOpenArmLeader: exception in a ROS callback -- dropping this "
+                    f"message and continuing rather than silently killing the spin thread.\n"
+                    f"{traceback.format_exc()}"
+                )
 
     def _on_joint_state(self, msg: JointState) -> None:
         self._latest_joint_state = msg

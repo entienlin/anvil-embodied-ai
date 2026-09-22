@@ -606,7 +606,8 @@ def patch_learner_progress_visibility() -> None:
 
     def _push(parameters_queue, policy):
         state["n"] += 1
-        print(f"[LEARNER-DBG] parameters pushed to queue (#{state['n']})", flush=True)
+        temp = getattr(policy, "temperature", None)
+        print(f"[LEARNER-DBG] parameters pushed to queue (#{state['n']}), temperature={temp}", flush=True)
         return orig_push(parameters_queue, policy)
 
     learner_mod.push_actor_policy_to_queue = _push

@@ -11,6 +11,7 @@ See the HIL-SERL plan for the full reasoning.
 import atexit
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -268,8 +269,36 @@ class AnvilOpenArmFollower(Robot):
         )
 
     def _spin_loop(self) -> None:
+        """Real-hardware finding (2026-09-22): a single corrupted/truncated
+        compressed camera frame (transient network issue, not a code bug --
+        cv2.imdecode() returning None) raised inside _cb()'s image-decode
+        call with no try/except anywhere in the callback chain. Since
+        nothing here caught it either, the exception propagated out of
+        spin_once() and killed this ENTIRE background thread silently
+        (Python threads print a traceback and just stop, no crash of the
+        main process). Every subsequent joint_state/image callback then
+        went unprocessed -- observations froze -- and ~7s later the
+        (correctly-behaving) liveness watchdog tripped on what looked like
+        an unresponsive arm, when the real cause was one bad camera frame
+        several seconds earlier. Guard broadly here (any callback, not
+        just images) so a single bad message degrades gracefully (that one
+        message is dropped, spinning continues) instead of silently
+        starving the whole observation pipeline.
+        """
         while not self._spin_stop.is_set() and rclpy.ok():
-            self._executor.spin_once(timeout_sec=0.05)
+            try:
+                self._executor.spin_once(timeout_sec=0.05)
+            except Exception:  # noqa: BLE001 -- see docstring: must not let this thread die
+                # rclpy's logger (unlike stdlib logging) has no exc_info=
+                # kwarg -- passing one raises TypeError from INSIDE this
+                # handler, which would silently kill the thread anyway
+                # (confirmed by _stage7b's own test catching this).
+                # Format the traceback into the message string instead.
+                self._node.get_logger().error(
+                    "AnvilOpenArmFollower: exception in a ROS callback -- dropping this "
+                    f"message and continuing rather than silently killing the spin thread.\n"
+                    f"{traceback.format_exc()}"
+                )
 
     def _heartbeat_loop(self) -> None:
         """Republishes the last-sent command if send_action() hasn't been
