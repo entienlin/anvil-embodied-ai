@@ -166,7 +166,16 @@ policy:
   # between extremes.
   policy_kwargs:
     std_max: 0.5
-  online_steps: 1000  # ~10 episodes; up from 300 (first BC-started run)
+  # 2026-09-22: bumped from 1000 -- every session so far has been far
+  # smaller than published HIL-SERL step counts for comparable tasks, and
+  # reward is sparse/terminal (reward=1.0 only on the single step `s` is
+  # pressed, 0.0 elsewhere -- confirmed via InterventionActionProcessorStep
+  # source read), so the critic needs many optimization steps to propagate
+  # that one signal backward through a ~100-200-step episode via TD
+  # bootstrapping. This run is the direct test of whether "just needs more
+  # training" (not reward sparsity itself) is the real bottleneck -- see
+  # the plan's "Strategic question" section.
+  online_steps: 4000  # ~30-40 episodes at this task's length
   online_step_before_learning: 10  # start mixing in demo data almost immediately
   # SAC entropy bonus at the default temperature_init=1.0 blew the BC actor's std back up to the 0.5 cap within 250 steps
   # (sampling std 0.02 -> 0.5, error vs demos 0.045 -> 0.2 on checkpoints 250/500/1000). Start with a small temperature.
