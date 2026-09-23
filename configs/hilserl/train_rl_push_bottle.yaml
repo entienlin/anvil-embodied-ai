@@ -147,7 +147,19 @@ policy:
   # BC v2: 2106 frames (5 demos + 17 human-driven episodes from the 09:32 and 10:0x runs), 2000 steps.
   # BC v4: HIL-SERL ResNet-10 image encoder (frozen, pretrained) + wrist image + 7 joint states; trained on the 11 newest human-driven episodes.
   vision_encoder_name: /workspace/configs/hilserl/resnet10
-  pretrained_path: /workspace/configs/hilserl/bc_pretrained_v4
+  # Chained forward (2026-09-23): this is the RL-trained result of the first
+  # real 4000-step session (started from bc_pretrained_v4). Checkpoint sweep
+  # of that session (hilserl_eval_checkpoint against the original 5 demos)
+  # showed a real but slow shape: error rose from BC's own 0.21 up to
+  # ~0.40-0.50 over steps 250-1750, then steadily recovered back down to
+  # ~0.20-0.21 by step 3250-4000 -- net result was roughly back to BC's
+  # own starting quality, not clearly past it. Chaining forward (instead of
+  # resetting to bc_pretrained_v4 every session, as every prior session
+  # did) tests whether that initial dip-then-recover is an artifact of
+  # restarting from a fresh BC checkpoint each time, or something that
+  # recurs regardless of starting point -- see the plan's "Strategic
+  # question" section for the full readout.
+  pretrained_path: /workspace/configs/hilserl/rl_ckpt_0923_step4000
   device: cuda
   push_to_hub: false
   use_torch_compile: false  # keep disabled -- avoid first-compile latency adding to an already cold-start-prone loop
