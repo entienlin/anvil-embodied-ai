@@ -11,14 +11,35 @@ this trains on raw dataset tensors. Actor loss = MSE(tanh(mean), demo action)
 plus a penalty on the unclamped std so the resulting policy acts near
 deterministically. No robot / ROS2 needed at runtime.
 
+Data prep (all on by default, see env vars) -- added 2026-09-24 after the
+offline learning-health analysis showed earlier BC checkpoints memorized
+their few training episodes (train loss 0.001) yet correlated only
++0.1..+0.3 with the human's actions on anything new:
+  * successes only   -- failed/timed-out demos are not something to imitate
+  * idle lead-in trimmed -- every recorded episode starts with ~2-3 s of
+    zero action while the operator presses space; those identical
+    home-pose frames teach "at home: do nothing", which is exactly the
+    stationary behaviour seen on the robot
+  * held-out episodes -- every BC_HOLDOUT_EVERY-th kept episode is never
+    trained on; held-out correlation with the human's action (per axis) is
+    printed every BC_EVAL_EVERY steps and the best checkpoint is kept.
+    This is the go/no-go gate before any RL.
+
 Usage (learner-style config, same yaml as the real run):
-    BC_STEPS=1500 BC_OUT=outputs/bc_pretrained \
+    BC_SKIP_BASE=1 BC_EXTRA_DATASETS=/demos BC_STEPS=3000 BC_OUT=outputs/bc_v5 \
     ros2 run lerobot_control hilserl_bc_pretrain --config_path <yaml>
+
+Env vars: BC_STEPS, BC_OUT, BC_BATCH (64), BC_SKIP_BASE, BC_EXTRA_DATASETS
+(comma-separated dataset roots), BC_SUCCESS_ONLY (1), BC_TRIM_IDLE (1),
+BC_IDLE_THRESH (0.02), BC_SMOOTH (1 = off; k = centered moving average of the
+training targets over k ticks), BC_HOLDOUT_EVERY (8; 0 = no hold-out),
+BC_EVAL_EVERY (250).
 """
 
 import logging
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 
@@ -29,6 +50,14 @@ import lerobot.policies.sac.configuration_sac  # noqa: F401,E402 -- registers th
 import lerobot.policies.sac.modeling_sac  # noqa: F401,E402
 
 STD_PENALTY_WEIGHT = 0.1
+_KEYS = ("observation.state", "observation.images.wrist_r")
+
+
+def _policy_action(policy, batch: dict) -> torch.Tensor:
+    """The deterministic action the real robot runs (tanh of the mean)."""
+    actor = policy.actor
+    hidden = actor.network(actor.encoder(batch, cache=None, detach=False))
+    return torch.tanh(actor.mean_layer(hidden))
 
 
 def _bc_loss(policy, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -42,13 +71,79 @@ def _bc_loss(policy, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Ten
     return mse + STD_PENALTY_WEIGHT * std.mean(), mse, std.mean()
 
 
+class _Frames(torch.utils.data.Dataset):
+    """Selected frames of one LeRobotDataset, with (optionally smoothed)
+    training targets. Returns only the tensors BC uses -- the saved
+    replay-buffer datasets carry different extra columns, which breaks
+    default_collate on a mixed batch."""
+
+    def __init__(self, inner, indices, targets, raw):
+        self.inner, self.indices, self.targets, self.raw = inner, indices, targets, raw
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        item = self.inner[int(self.indices[i])]
+        out = {k: item[k] for k in _KEYS}
+        out["action"] = torch.as_tensor(self.targets[i], dtype=torch.float32)
+        out["action_raw"] = torch.as_tensor(self.raw[i], dtype=torch.float32)
+        return out
+
+
+def _episodes(ds, success_only: bool, trim_idle: bool, idle_thresh: float, smooth: int):
+    """-> list of (frame_indices, training_targets, raw_actions), one per kept episode."""
+    ep = np.array([int(x) for x in ds.hf_dataset["episode_index"]])
+    rew = np.array([float(np.array(x).reshape(-1)[0]) for x in ds.hf_dataset["next.reward"]])
+    act = np.stack([np.array(x) for x in ds.hf_dataset["action"]]).astype(np.float32)
+    kept = []
+    for e in sorted(set(ep)):
+        idx = np.where(ep == e)[0]
+        if success_only and rew[idx].max() <= 0:
+            continue
+        a = act[idx]
+        if trim_idle:
+            moving = np.where(np.abs(a).max(1) > idle_thresh)[0]
+            first = int(moving[0]) if len(moving) else 0
+            idx, a = idx[first:], a[first:]
+        tgt = a
+        if smooth > 1:
+            pad = smooth // 2
+            padded = np.pad(a, ((pad, smooth - 1 - pad), (0, 0)), mode="edge")
+            tgt = np.stack([padded[k : k + len(a)] for k in range(smooth)]).mean(0)
+        kept.append((idx, tgt, a))
+    return kept
+
+
+@torch.no_grad()
+def _evaluate(policy, loader, device) -> tuple[np.ndarray, float]:
+    policy.eval()
+    pa, ra = [], []
+    for raw in loader:
+        batch = {k: v.to(device) for k, v in raw.items() if k in _KEYS}
+        pa.append(_policy_action(policy, batch).cpu().numpy())
+        ra.append(raw["action_raw"].numpy())
+    policy.train()
+    pa, ra = np.concatenate(pa), np.concatenate(ra)
+    corr = np.array([np.corrcoef(pa[:, k], ra[:, k])[0, 1] if pa[:, k].std() > 1e-9 else 0.0 for k in range(3)])
+    mse = float(((pa - np.clip(ra, -0.99, 0.99)) ** 2).mean())
+    return corr, mse
+
+
 def bc_pretrain(cfg) -> None:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.policies.factory import make_policy
 
-    steps = int(os.environ.get("BC_STEPS", "1500"))
-    out_dir = os.environ.get("BC_OUT", "outputs/bc_pretrained")
-    batch_size = int(os.environ.get("BC_BATCH", "64"))
+    env = os.environ.get
+    steps = int(env("BC_STEPS", "1500"))
+    out_dir = env("BC_OUT", "outputs/bc_pretrained")
+    batch_size = int(env("BC_BATCH", "64"))
+    success_only = env("BC_SUCCESS_ONLY", "1") == "1"
+    trim_idle = env("BC_TRIM_IDLE", "1") == "1"
+    idle_thresh = float(env("BC_IDLE_THRESH", "0.02"))
+    smooth = int(env("BC_SMOOTH", "1"))
+    holdout_every = int(env("BC_HOLDOUT_EVERY", "8"))
+    eval_every = int(env("BC_EVAL_EVERY", "250"))
     if os.path.exists(out_dir):
         raise FileExistsError(f"{out_dir} already exists; pick a new BC_OUT")
 
@@ -56,42 +151,47 @@ def bc_pretrain(cfg) -> None:
     policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env)
     policy.train()
 
-    datasets = []
-    if os.environ.get("BC_SKIP_BASE") != "1":  # BC_SKIP_BASE=1: train ONLY on BC_EXTRA_DATASETS
-        datasets.append(
+    sources = []
+    if env("BC_SKIP_BASE") != "1":  # BC_SKIP_BASE=1: train ONLY on BC_EXTRA_DATASETS
+        sources.append(
             LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, video_backend=cfg.dataset.video_backend)
         )
-    # Optional extra human-driven data (e.g. the learner's saved replay-buffer
-    # datasets, outputs/<run>/dataset), comma-separated container paths.
-    for i, root in enumerate(p for p in os.environ.get("BC_EXTRA_DATASETS", "").split(",") if p):
+    for i, root in enumerate(p for p in env("BC_EXTRA_DATASETS", "").split(",") if p):
         extra = LeRobotDataset(f"local/bc_extra_{i}", root=root, video_backend=cfg.dataset.video_backend)
         print(f"[BC] extra dataset {root}: {extra.num_episodes} episodes, {len(extra)} frames", flush=True)
-        datasets.append(extra)
+        sources.append(extra)
 
-    class _Keys(torch.utils.data.Dataset):
-        """Only the tensors BC uses -- the saved replay-buffer datasets carry
-        different extra columns, which breaks default_collate on a mixed batch."""
+    train_parts, hold_parts, n_kept, n_total = [], [], 0, 0
+    for ds in sources:
+        n_total += ds.num_episodes
+        for idx, tgt, raw in _episodes(ds, success_only, trim_idle, idle_thresh, smooth):
+            is_holdout = holdout_every > 0 and n_kept % holdout_every == holdout_every - 1
+            (hold_parts if is_holdout else train_parts).append(_Frames(ds, idx, tgt, raw))
+            n_kept += 1
+    train_ds = torch.utils.data.ConcatDataset(train_parts)
+    print(
+        f"[BC] {n_kept}/{n_total} episodes kept (success_only={success_only}, trim_idle={trim_idle}, smooth={smooth}); "
+        f"train {len(train_parts)} eps / {len(train_ds)} frames, held-out {len(hold_parts)} eps",
+        flush=True,
+    )
+    loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=4)
+    hold_loader = (
+        torch.utils.data.DataLoader(torch.utils.data.ConcatDataset(hold_parts), batch_size=128, num_workers=2)
+        if hold_parts
+        else None
+    )
+    # A fixed slice of TRAIN frames scored the same way, to make over-fitting visible.
+    train_probe = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(train_ds, list(range(0, len(train_ds), max(1, len(train_ds) // 300)))),
+        batch_size=128,
+        num_workers=2,
+    )
 
-        def __init__(self, inner):
-            self.inner = inner
-
-        def __len__(self):
-            return len(self.inner)
-
-        def __getitem__(self, i):
-            item = self.inner[i]
-            return {k: item[k] for k in ("observation.state", "observation.images.wrist_r", "action")}
-
-    ds = torch.utils.data.ConcatDataset([_Keys(d) for d in datasets])
-    print(f"[BC] training on {len(ds)} frames total", flush=True)
-    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=4)
-
-    params = list(policy.actor.parameters())
-    opt = torch.optim.Adam(params, lr=3e-4)
-    step = 0
+    opt = torch.optim.Adam(list(policy.actor.parameters()), lr=3e-4)
+    best_score, best_state, step = -9.0, None, 0
     while step < steps:
         for raw in loader:
-            batch = {k: v.to(device) for k, v in raw.items() if isinstance(v, torch.Tensor)}
+            batch = {k: v.to(device) for k, v in raw.items() if k in _KEYS + ("action",)}
             loss, mse, std = _bc_loss(policy, batch)
             opt.zero_grad()
             loss.backward()
@@ -99,11 +199,26 @@ def bc_pretrain(cfg) -> None:
             step += 1
             if step % 50 == 0 or step == 1:
                 print(f"[BC] step {step}/{steps} loss {loss.item():.4f} mse {mse.item():.4f} mean_std {std.item():.4f}", flush=True)
+            if step % eval_every == 0 or step == steps:
+                tc, _ = _evaluate(policy, train_probe, device)
+                if hold_loader is not None:
+                    hc, hm = _evaluate(policy, hold_loader, device)
+                    score = float(hc.mean())
+                    tag = ""
+                    if score > best_score:
+                        best_score, tag = score, "  <- best so far"
+                        best_state = {k: v.detach().clone() for k, v in policy.state_dict().items()}
+                    print(f"[BC-EVAL] step {step}: HELD-OUT corr x/y/z = {np.round(hc, 3)} (mean {score:+.3f}) mse {hm:.4f} | train corr = {np.round(tc, 3)}{tag}", flush=True)
+                else:
+                    print(f"[BC-EVAL] step {step}: train corr = {np.round(tc, 3)} (no held-out set)", flush=True)
             if step >= steps:
                 break
 
+    if best_state is not None:
+        policy.load_state_dict(best_state)
+        print(f"[BC] restored best held-out checkpoint (mean corr {best_score:+.3f})", flush=True)
     policy.save_pretrained(out_dir)
-    logging.info("[BC] saved pretrained policy to %s", out_dir)
+    print(f"[BC] saved pretrained policy to {out_dir}", flush=True)
 
 
 def main() -> None:
