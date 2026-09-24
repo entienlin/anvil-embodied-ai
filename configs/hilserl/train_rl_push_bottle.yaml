@@ -178,7 +178,9 @@ policy:
   # 2026-09-24: BC v6 = v5's 40 demos + 732 human-driven steps (20 segments, x3) from round-1
   # DAgger (BC v5-B driving, 10 episodes, 6 successes; the human did the descent every time).
   # Held-out demo corr +0.765 (the gate only covers demo frames, not the corrections).
-  pretrained_path: /workspace/configs/hilserl/bc_pretrained_v6
+  # 2026-09-24: BC v7 = demos + round-1 and round-2 DAgger corrections (BC v6 drove round 2:
+  # 14 episodes, 10 successes, intervention rate still 0.3-0.57). Held-out demo corr +0.767.
+  pretrained_path: /workspace/configs/hilserl/bc_pretrained_v7
   device: cuda
   push_to_hub: false
   # 2026-09-24: official HIL-SERL docs (huggingface.co/docs/lerobot/en/hilserl,
