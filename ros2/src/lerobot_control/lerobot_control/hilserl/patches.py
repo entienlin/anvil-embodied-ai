@@ -514,6 +514,36 @@ def patch_sac_freeze_temperature() -> None:
 _episode_stats_state: dict = {"path": None}
 
 
+_auto_stop_state = {"episodes": 0}
+
+
+def _max_episodes() -> int:
+    """HILSERL_MAX_EPISODES=N (default 0 = off): stop the actor after N finished
+    episodes, and the learner after N received episode summaries when it is
+    not training (BC-only runs). Read on every call so tests can set it."""
+    import os as _os
+
+    try:
+        return int(_os.environ.get("HILSERL_MAX_EPISODES", "0"))
+    except ValueError:
+        return 0
+
+
+def _request_stop(who: str, n: int, delay_s: float = 0.0) -> None:
+    """SIGINT ourselves = the same clean shutdown path as pressing Ctrl+C."""
+    import os as _os
+    import signal as _signal
+    import threading as _threading
+
+    print(f"[{who}] reached HILSERL_MAX_EPISODES={n} -- stopping (same as Ctrl+C).", flush=True)
+    if delay_s > 0:
+        t = _threading.Timer(delay_s, lambda: _os.kill(_os.getpid(), _signal.SIGINT))
+        t.daemon = True
+        t.start()
+    else:
+        _os.kill(_os.getpid(), _signal.SIGINT)
+
+
 def patch_learner_episode_stats_logging() -> None:
     """Official HIL-SERL docs (huggingface.co/docs/lerobot/en/hilserl) define
     a successful run as one where "the human has to intervene at the start
@@ -547,6 +577,8 @@ def patch_learner_episode_stats_logging() -> None:
 
     def _train(cfg, *a, **kw):
         _episode_stats_state["path"] = _os.path.join(cfg.output_dir, "episode_stats.jsonl")
+        # BC-only run (learning never starts): nothing to save, safe to stop on episode count
+        _episode_stats_state["bc_only"] = cfg.policy.online_step_before_learning >= cfg.policy.online_steps
         return orig_train(cfg, *a, **kw)
 
     learner_mod.train = _train
@@ -570,6 +602,11 @@ def patch_learner_episode_stats_logging() -> None:
                 )
         except Exception as e:  # noqa: BLE001 -- logging must never break training
             print(f"[EPISODE-STATS] could not record episode stats: {e}", flush=True)
+        n = _max_episodes()
+        if n > 0 and _episode_stats_state.get("bc_only"):
+            _auto_stop_state["learner_episodes"] = _auto_stop_state.get("learner_episodes", 0) + 1
+            if _auto_stop_state["learner_episodes"] == n:
+                _request_stop("LEARNER", n, delay_s=3.0)
         return result
 
     learner_mod.process_interaction_message = _process_interaction_message
@@ -837,7 +874,14 @@ def patch_learner_progress_visibility() -> None:
         def _push_t(transitions, transitions_queue):
             print(f"[ACTOR-DBG] queueing {len(transitions)} transitions for the learner", flush=True)
             save_actor_trajectory(transitions)
-            return orig_push_t(transitions, transitions_queue)
+            result = orig_push_t(transitions, transitions_queue)
+            n = _max_episodes()
+            if n > 0:
+                _auto_stop_state["episodes"] += 1
+                print(f"[ACTOR-DBG] episode {_auto_stop_state['episodes']}/{n} saved", flush=True)
+                if _auto_stop_state["episodes"] == n:
+                    _request_stop("ACTOR", n)  # the episode-end homing still completes first
+            return result
 
         actor_mod.push_transitions_to_transport_queue = _push_t
     except Exception:  # noqa: BLE001
