@@ -462,7 +462,12 @@ class AnvilOpenArmLeader(Teleoperator):
             TeleopEvents.SUCCESS: labels["success"],
             TeleopEvents.FAILURE: labels["failure"],
             TeleopEvents.RERECORD_EPISODE: labels["rerecord"],
-            TeleopEvents.TERMINATE_EPISODE: labels["success"] or labels["failure"],
+            # `r` must END the episode too: lerobot's record loop only checks
+            # RERECORD_EPISODE at the step the episode terminates, and this flag
+            # is one-shot, so a bare `r` mid-episode was silently lost and the
+            # botched demo got saved anyway. With r terminating, the same step
+            # carries RERECORD_EPISODE and the record loop discards the episode.
+            TeleopEvents.TERMINATE_EPISODE: labels["success"] or labels["failure"] or labels["rerecord"],
         }
 
     def send_feedback(self, feedback: dict) -> None:

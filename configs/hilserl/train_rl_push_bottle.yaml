@@ -219,6 +219,12 @@ policy:
 output_dir: outputs/hilserl_push_bottle
 job_name: hilserl_push_bottle
 seed: 42
+# 2026-09-24: 8 (library default, never set before) -> 256. Offline experiment on the
+# archived data (actor fixed, critic only): the critic's sensitivity to the ACTION --
+# the only signal SAC's actor improves from -- was ~10x larger at batch 256 than at
+# batch 8 (ratio 0.3% -> 3.0%, |dQ/da| 0.014 -> 0.119), and batch 8 reproduced the
+# real runs' near-zero action gradient. Still small (data-limited), see the plan.
+batch_size: 256
 save_freq: 250  # intermediate checkpoints (counts optimization steps) so an early Ctrl+C does not lose everything
 wandb:
   enable: false
