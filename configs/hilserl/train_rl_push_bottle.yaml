@@ -110,7 +110,7 @@ env:
       target_frame_name: follower_r_hand_tcp
       end_effector_bounds:
         min: [-0.0247, -0.4427, 0.1117]
-        max: [0.4159, 0.0418, 0.3090]
+        max: [0.4159, 0.0418, 0.40]  # z raised 0.309 -> 0.40 (2026-09-24): the homed pose is z~0.355, above the old ceiling, which forced a descent every episode
       end_effector_step_sizes:
         x: 0.02
         y: 0.02
@@ -164,7 +164,14 @@ policy:
   # chained checkpoint) showed no early dip -- confirming the dip was a
   # restart-from-BC artifact -- but stayed flat (~0.19-0.24 error vs the
   # reference demos) rather than improving further.
-  pretrained_path: /workspace/configs/hilserl/rl_ckpt_0924_step4000
+  # 2026-09-24: back to the clean BC v4 start (was chained rl_ckpt_0924_step4000).
+  # The chained RL checkpoints were trained while the follower's per-joint
+  # limiters distorted every policy-driven motion (commanded EE motion did not
+  # match actual motion -- see robot_anvil_openarm.py send_action), so their
+  # policy-driven transitions taught the critic the wrong dynamics. They stayed
+  # flat at ~0.2 error anyway. Chain forward again once a run under the fixed
+  # limiter shows real progress.
+  pretrained_path: /workspace/configs/hilserl/bc_pretrained_v4
   device: cuda
   push_to_hub: false
   # 2026-09-24: official HIL-SERL docs (huggingface.co/docs/lerobot/en/hilserl,

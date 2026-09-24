@@ -96,7 +96,7 @@ env:
       # at the literal edge of what was actually swept through.
       end_effector_bounds:
         min: [-0.0247, -0.4427, 0.1117]
-        max: [0.4159, 0.0418, 0.3090]
+        max: [0.4159, 0.0418, 0.40]  # z raised 0.309 -> 0.40 (2026-09-24): the homed pose is z~0.355, above the old ceiling, which forced a descent every episode
       end_effector_step_sizes:
         x: 0.02
         y: 0.02

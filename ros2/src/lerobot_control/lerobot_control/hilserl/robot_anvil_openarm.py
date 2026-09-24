@@ -446,6 +446,15 @@ class AnvilOpenArmFollower(Robot):
 
         return obs
 
+    @staticmethod
+    def _scale_to_cap(delta: np.ndarray, cap: float) -> np.ndarray:
+        """Shrink `delta` uniformly so its largest joint component is <= cap,
+        keeping the direction (ratios between joints) unchanged."""
+        largest = float(np.max(np.abs(delta)))
+        if largest <= cap or largest == 0.0:
+            return delta
+        return delta * (cap / largest)
+
     def _check_liveness(self, commanded_rad: np.ndarray, observed_rad: np.ndarray | None) -> None:
         """Raise if we've been commanding real movement for a full window
         with zero observed response -- see the watchdog docstring in
@@ -510,7 +519,26 @@ class AnvilOpenArmFollower(Robot):
         if all(j in name_to_pos for j in self.joint_names):
             current_rad = np.array([name_to_pos[j] for j in self.joint_names], dtype=np.float64)
 
-        clamped_rad = self._action_limiter.process(target_rad, current_positions=current_rad)
+        # Both limits below scale the WHOLE joint-delta vector together
+        # (direction-preserving) instead of clipping each joint independently.
+        # Independent per-joint clipping (what ActionLimiter.apply_delta_limit
+        # and the earlier version of the step cap here did) changes the RATIO
+        # between joints, so the IK's intended end-effector motion is bent
+        # into a different direction whenever more than one joint saturates.
+        # Reproduced offline 2026-09-24 (simulated real pipeline): from the
+        # homed pose, the z-ceiling clip demands a ~5 cm descent, the joints
+        # (1, 4, 7) saturate at different ratios, and the hand ROSE from
+        # z=0.357 to 0.45 with joint 7 swinging 31 -> 89 deg -- matching the
+        # real recorded episodes (all 13 rose, joint 7 to ~70 deg). With no
+        # limiter, or scaling as below, the same demand descends to the
+        # ceiling and holds. The shared ActionLimiter is left alone (it also
+        # serves production inference); only this class stops using it.
+        if current_rad is not None:
+            clamped_rad = current_rad + self._scale_to_cap(
+                target_rad - current_rad, self.config.max_position_delta
+            )
+        else:
+            clamped_rad = target_rad
 
         step = self.config.max_command_step_rad
         if step is not None:
@@ -518,7 +546,7 @@ class AnvilOpenArmFollower(Robot):
                 last = self._last_sent_msg
             if last is not None:
                 last_arm = np.asarray(last.data[: len(clamped_rad)], dtype=np.float64)
-                clamped_rad = last_arm + np.clip(clamped_rad - last_arm, -step, step)
+                clamped_rad = last_arm + self._scale_to_cap(clamped_rad - last_arm, step)
 
         self._check_liveness(clamped_rad, current_rad)
 
