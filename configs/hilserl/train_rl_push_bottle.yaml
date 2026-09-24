@@ -159,9 +159,20 @@ policy:
   # restarting from a fresh BC checkpoint each time, or something that
   # recurs regardless of starting point -- see the plan's "Strategic
   # question" section for the full readout.
-  pretrained_path: /workspace/configs/hilserl/rl_ckpt_0923_step4000
+  # 2026-09-24: chained again, to the second 4000-step session's own final
+  # checkpoint (rl_ckpt_0923_step4000 -> this). Session 2 (started from the
+  # chained checkpoint) showed no early dip -- confirming the dip was a
+  # restart-from-BC artifact -- but stayed flat (~0.19-0.24 error vs the
+  # reference demos) rather than improving further.
+  pretrained_path: /workspace/configs/hilserl/rl_ckpt_0924_step4000
   device: cuda
   push_to_hub: false
+  # 2026-09-24: official HIL-SERL docs (huggingface.co/docs/lerobot/en/hilserl,
+  # "Key hyperparameters to tune") recommend cuda here when GPU memory is spare:
+  # "removes CPU->GPU transfer overhead and can significantly increase the number
+  # of learner updates per second". Default is cpu, which is what every session
+  # before this one used. GPU 1 has ~98GB free; buffers here are ~1GB.
+  storage_device: cuda
   use_torch_compile: false  # keep disabled -- avoid first-compile latency adding to an already cold-start-prone loop
   # SACPolicy.select_action() always stochastically samples from
   # Normal(mean, std) before tanh-squashing -- there's no deterministic/

@@ -511,6 +511,70 @@ def patch_sac_freeze_temperature() -> None:
     SACPolicy.compute_loss_temperature = _compute_loss_temperature_frozen
 
 
+_episode_stats_state: dict = {"path": None}
+
+
+def patch_learner_episode_stats_logging() -> None:
+    """Official HIL-SERL docs (huggingface.co/docs/lerobot/en/hilserl) define
+    a successful run as one where "the human has to intervene at the start
+    but then reduces the amount of interventions as the policy improves",
+    monitored via the intervention rate. lerobot's actor.py already computes
+    exactly that per episode (`Intervention rate` = intervention steps /
+    total steps, plus `Episodic reward`, `Episode intervention`,
+    `Interaction step`) and sends it to the learner in every interaction
+    message -- but the learner only forwards it to wandb, which this project
+    keeps disabled, so it was silently dropped every session.
+
+    Wrap process_interaction_message() (called once per received episode
+    summary) to also append each message as one JSON line to
+    <output_dir>/episode_stats.jsonl (output_dir is on the mounted volume,
+    so it survives the container) and print a one-line summary live.
+    train() is wrapped only to learn cfg.output_dir. Pure logging: the
+    original function still runs first and its return value is unchanged.
+    """
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_episode_stats_patched", False):
+        return
+    learner_mod._anvil_episode_stats_patched = True
+
+    import json as _json
+    import os as _os
+
+    orig_train = learner_mod.train
+
+    def _train(cfg, *a, **kw):
+        _episode_stats_state["path"] = _os.path.join(cfg.output_dir, "episode_stats.jsonl")
+        return orig_train(cfg, *a, **kw)
+
+    learner_mod.train = _train
+
+    orig_msg = learner_mod.process_interaction_message
+
+    def _process_interaction_message(message, interaction_step_shift, wandb_logger=None):
+        result = orig_msg(message, interaction_step_shift, wandb_logger)
+        try:
+            path = _episode_stats_state["path"]
+            if path is not None and isinstance(result, dict):
+                _os.makedirs(_os.path.dirname(path), exist_ok=True)
+                record = {k: (float(v) if hasattr(v, "__float__") else v) for k, v in result.items()}
+                with open(path, "a") as f:
+                    f.write(_json.dumps(record) + "\n")
+                print(
+                    f"[EPISODE-STATS] step={record.get('Interaction step')} "
+                    f"reward={record.get('Episodic reward')} "
+                    f"intervention_rate={record.get('Intervention rate')}",
+                    flush=True,
+                )
+        except Exception as e:  # noqa: BLE001 -- logging must never break training
+            print(f"[EPISODE-STATS] could not record episode stats: {e}", flush=True)
+        return result
+
+    learner_mod.process_interaction_message = _process_interaction_message
+
+
 def apply_all_patches() -> None:
     """Single entry point for every runtime patch in this file. All of
     lerobot.rl.gym_manipulator's make_robot_env()/make_processors() pipeline
@@ -537,6 +601,7 @@ def apply_all_patches() -> None:
     patch_learner_stop_at_online_steps()
     patch_sac_deterministic_inference()
     patch_sac_freeze_temperature()
+    patch_learner_episode_stats_logging()
 
 
 def patch_learner_stop_at_online_steps() -> None:
