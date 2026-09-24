@@ -57,8 +57,8 @@ env:
     camera_topics:
       wrist_r: /cam_wrist_r/image_raw/compressed
     control_frequency: 10.0
-    max_position_delta: 0.05  # per-tick clamp around MEASURED pose; 0.30 allowed 0.6 rad reversals in 100ms (fault #11 trace)
-    max_command_step_rad: 0.03  # consecutive published commands may differ by at most this (kills policy wobble)
+    max_position_delta: 0.08  # per-tick cap around MEASURED pose (0.05 until 2026-09-24; measured to throttle a push to ~40% of what the policy asks)
+    max_command_step_rad: 0.06  # consecutive published commands may differ by at most this (0.03 until 2026-09-24; both caps now scale the whole joint vector, see robot_anvil_openarm.py)
     obs_timeout_s: 2.0
 
   teleop:

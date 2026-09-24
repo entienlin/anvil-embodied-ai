@@ -642,6 +642,7 @@ def apply_all_patches() -> None:
     patch_sac_freeze_temperature()
     patch_learner_episode_stats_logging()
     patch_robot_env_step_keeps_intervention_flag()
+    patch_intervention_flag_in_complementary_info()
 
 
 def patch_learner_stop_at_online_steps() -> None:
@@ -679,11 +680,15 @@ def save_actor_trajectory(transitions) -> str | None:
     """Write one episode's executed trajectory to disk (2026-09-24).
 
     BC-only test runs never train, so the learner never exports its replay
-    buffer and everything the actor did was lost -- the operator's report
-    ("slightly better, not significantly") could only be judged by feel. This
-    saves, per episode, the joint state (degrees, as observed), the EXECUTED
-    action (human's when intervening, policy's otherwise), the reward and the
-    done flag as a compressed .npz. Directory: $HILSERL_TRAJ_DIR (default
+    buffer and everything the actor did was lost. This saves, per episode, as
+    an uncompressed .npz: joint state (degrees, as observed), the wrist image
+    the policy saw (float16, 3x128x128), the EXECUTED action (the human's when
+    intervening, the policy's otherwise), reward, done, and a per-step
+    `is_intervention` flag (carried in complementary_info["discrete_penalty"],
+    a slot this gripper-less task never uses -- see
+    patch_intervention_flag_in_complementary_info). That is exactly what a
+    DAgger-style retrain needs: the human's corrections at the states the
+    policy actually reached. Directory: $HILSERL_TRAJ_DIR (default
     /workspace/outputs/actor_trajectories -- mount ~/.../outputs there on the
     ACTOR container to keep it). Logging only: any failure is swallowed.
     """
@@ -697,18 +702,66 @@ def save_actor_trajectory(transitions) -> str | None:
         def _vec(x):
             return _torch.as_tensor(x).detach().cpu().float().reshape(-1).numpy()
 
+        def _img(x):
+            x = _torch.as_tensor(x).detach().cpu().float()
+            return x.reshape(-1, *x.shape[-3:])[0].numpy().astype(_np.float16)
+
         out_dir = _os.environ.get("HILSERL_TRAJ_DIR", "/workspace/outputs/actor_trajectories")
         _os.makedirs(out_dir, exist_ok=True)
         state = _np.stack([_vec(t["state"]["observation.state"]) for t in transitions])
         action = _np.stack([_vec(t["action"]) for t in transitions])
         reward = _np.array([float(_vec(t["reward"])[0]) for t in transitions], dtype=_np.float32)
         done = _np.array([float(_vec(t["done"])[0]) for t in transitions], dtype=_np.float32)
+        flag = _np.array(
+            [float(_vec((t.get("complementary_info") or {}).get("discrete_penalty", 0.0))[0]) for t in transitions],
+            dtype=_np.float32,
+        )
+        arrays = dict(state_deg=state, action=action, reward=reward, done=done, is_intervention=flag)
+        img_key = "observation.images.wrist_r"
+        if all(img_key in t["state"] for t in transitions):
+            arrays["image"] = _np.stack([_img(t["state"][img_key]) for t in transitions])
         path = _os.path.join(out_dir, f"ep_{_time.strftime('%Y%m%d_%H%M%S')}_{len(transitions)}steps.npz")
-        _np.savez_compressed(path, state_deg=state, action=action, reward=reward, done=done)
+        _np.savez(path, **arrays)
         return path
     except Exception as e:  # noqa: BLE001 -- must never break the control loop
         print(f"[ACTOR-DBG] could not save trajectory: {e}", flush=True)
         return None
+
+
+def patch_intervention_flag_in_complementary_info() -> None:
+    """Per-step intervention flag for the replay buffer / saved trajectories.
+
+    lerobot's actor builds each Transition's complementary_info from
+    `complementary_data["discrete_penalty"]` only; nothing carries whether the
+    executed action was the human's, so past sessions' data could not be split
+    into human corrections vs policy actions (and learner.py's offline-buffer
+    growth for interventions, which reads IS_INTERVENTION there, never fired).
+    `discrete_penalty` is consumed solely by the discrete-gripper critic
+    (modeling_sac.compute_loss_discrete_critic, only when num_discrete_actions
+    is set) -- unused by this gripper-less task -- so it is free to carry
+    float(is_intervention). InterventionActionProcessorStep already reads the
+    true flag from its INPUT info; we just copy it into complementary_data.
+    """
+    from lerobot.processor.hil_processor import InterventionActionProcessorStep
+    from lerobot.teleoperators.utils import TeleopEvents
+    from lerobot.types import TransitionKey
+
+    if getattr(InterventionActionProcessorStep, "_anvil_flag_patched", False):
+        return
+    InterventionActionProcessorStep._anvil_flag_patched = True
+
+    orig_call = InterventionActionProcessorStep.__call__
+
+    def _call(self, transition):
+        info_in = transition.get(TransitionKey.INFO) or {}
+        is_intervention = bool(info_in.get(TeleopEvents.IS_INTERVENTION, False))
+        out = orig_call(self, transition)
+        data = out.get(TransitionKey.COMPLEMENTARY_DATA) or {}
+        data["discrete_penalty"] = float(is_intervention)
+        out[TransitionKey.COMPLEMENTARY_DATA] = data
+        return out
+
+    InterventionActionProcessorStep.__call__ = _call
 
 
 def patch_learner_progress_visibility() -> None:
