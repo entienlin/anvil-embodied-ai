@@ -175,7 +175,10 @@ policy:
   # homed start (idle lead-in trimmed, targets smoothed over 3 ticks, 5 episodes
   # held out; best checkpoint at step 1750). HELD-OUT correlation with the human's
   # action x/y/z = 0.69/0.84/0.91 (mean +0.816) vs +0.1..+0.3 for BC v4 on new data.
-  pretrained_path: /workspace/configs/hilserl/bc_pretrained_v5
+  # 2026-09-24: BC v6 = v5's 40 demos + 732 human-driven steps (20 segments, x3) from round-1
+  # DAgger (BC v5-B driving, 10 episodes, 6 successes; the human did the descent every time).
+  # Held-out demo corr +0.765 (the gate only covers demo frames, not the corrections).
+  pretrained_path: /workspace/configs/hilserl/bc_pretrained_v6
   device: cuda
   push_to_hub: false
   # 2026-09-24: official HIL-SERL docs (huggingface.co/docs/lerobot/en/hilserl,
