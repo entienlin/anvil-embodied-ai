@@ -575,6 +575,45 @@ def patch_learner_episode_stats_logging() -> None:
     learner_mod.process_interaction_message = _process_interaction_message
 
 
+def patch_robot_env_step_keeps_intervention_flag() -> None:
+    """Found 2026-09-24 while adding per-episode intervention-rate logging:
+    the rate read 0.0 in every episode even though the operator was
+    intervening heavily. Root cause (lerobot 0.5.1, not this project's code):
+    `RobotEnv.step()` unconditionally returns `{IS_INTERVENTION: False}` as
+    its `info`, and `step_env_and_process_transition()` then does
+    `new_info = <info the intervention processor set>; new_info.update(info)`
+    -- the env's hard-coded False overwrites the True that
+    InterventionActionProcessorStep had just recorded. So actor.py's
+    `intervention_info.get(IS_INTERVENTION)` is always False: episode
+    intervention counts/rate are always 0, and learner.py's offline-buffer
+    growth for interventions (`transition["complementary_info"]
+    .get(IS_INTERVENTION)`) can never fire. (The ACTIONS sent to the learner
+    are unaffected -- they come from complementary_data["teleop_action"],
+    set before the overwrite.)
+
+    Fix: drop the key from the env's returned info so `update()` cannot
+    clobber the processor's value. Every reader of the key uses
+    `.get(IS_INTERVENTION, False)`, so an absent key still reads False when
+    the operator is not intervening.
+    """
+    from lerobot.rl.gym_manipulator import RobotEnv
+    from lerobot.teleoperators.utils import TeleopEvents
+
+    if getattr(RobotEnv, "_anvil_step_flag_patched", False):
+        return
+    RobotEnv._anvil_step_flag_patched = True
+
+    orig_step = RobotEnv.step
+
+    def _step(self, action):
+        obs, reward, terminated, truncated, info = orig_step(self, action)
+        info = dict(info)
+        info.pop(TeleopEvents.IS_INTERVENTION, None)
+        return obs, reward, terminated, truncated, info
+
+    RobotEnv.step = _step
+
+
 def apply_all_patches() -> None:
     """Single entry point for every runtime patch in this file. All of
     lerobot.rl.gym_manipulator's make_robot_env()/make_processors() pipeline
@@ -602,6 +641,7 @@ def apply_all_patches() -> None:
     patch_sac_deterministic_inference()
     patch_sac_freeze_temperature()
     patch_learner_episode_stats_logging()
+    patch_robot_env_step_keeps_intervention_flag()
 
 
 def patch_learner_stop_at_online_steps() -> None:
