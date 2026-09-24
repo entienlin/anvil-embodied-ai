@@ -675,6 +675,42 @@ def patch_learner_stop_at_online_steps() -> None:
     learner_mod.save_training_checkpoint = _save
 
 
+def save_actor_trajectory(transitions) -> str | None:
+    """Write one episode's executed trajectory to disk (2026-09-24).
+
+    BC-only test runs never train, so the learner never exports its replay
+    buffer and everything the actor did was lost -- the operator's report
+    ("slightly better, not significantly") could only be judged by feel. This
+    saves, per episode, the joint state (degrees, as observed), the EXECUTED
+    action (human's when intervening, policy's otherwise), the reward and the
+    done flag as a compressed .npz. Directory: $HILSERL_TRAJ_DIR (default
+    /workspace/outputs/actor_trajectories -- mount ~/.../outputs there on the
+    ACTOR container to keep it). Logging only: any failure is swallowed.
+    """
+    import os as _os
+    import time as _time
+
+    try:
+        import numpy as _np
+        import torch as _torch
+
+        def _vec(x):
+            return _torch.as_tensor(x).detach().cpu().float().reshape(-1).numpy()
+
+        out_dir = _os.environ.get("HILSERL_TRAJ_DIR", "/workspace/outputs/actor_trajectories")
+        _os.makedirs(out_dir, exist_ok=True)
+        state = _np.stack([_vec(t["state"]["observation.state"]) for t in transitions])
+        action = _np.stack([_vec(t["action"]) for t in transitions])
+        reward = _np.array([float(_vec(t["reward"])[0]) for t in transitions], dtype=_np.float32)
+        done = _np.array([float(_vec(t["done"])[0]) for t in transitions], dtype=_np.float32)
+        path = _os.path.join(out_dir, f"ep_{_time.strftime('%Y%m%d_%H%M%S')}_{len(transitions)}steps.npz")
+        _np.savez_compressed(path, state_deg=state, action=action, reward=reward, done=done)
+        return path
+    except Exception as e:  # noqa: BLE001 -- must never break the control loop
+        print(f"[ACTOR-DBG] could not save trajectory: {e}", flush=True)
+        return None
+
+
 def patch_learner_progress_visibility() -> None:
     """Learner-side gRPC/training threads' logging.info() output never showed
     up in the terminal (2026-09-21: two 1000-step runs looked identical to a
@@ -747,6 +783,7 @@ def patch_learner_progress_visibility() -> None:
 
         def _push_t(transitions, transitions_queue):
             print(f"[ACTOR-DBG] queueing {len(transitions)} transitions for the learner", flush=True)
+            save_actor_trajectory(transitions)
             return orig_push_t(transitions, transitions_queue)
 
         actor_mod.push_transitions_to_transport_queue = _push_t
