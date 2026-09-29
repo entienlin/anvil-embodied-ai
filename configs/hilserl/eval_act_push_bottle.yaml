@@ -1,0 +1,137 @@
+# =============================================================================
+# ACT proof-of-concept eval, single-arm push-bottle task
+# =============================================================================
+# Same env/robot/teleop/processor wiring as train_rl_push_bottle.yaml (the
+# HIL-SERL task config) -- reused verbatim, since it's already real-hardware-
+# validated (safety bounds, limiter, IK-reseed fix, homing reset, etc. all
+# apply regardless of which policy is driving). Only the `policy:` block
+# differs: a plain ACT checkpoint trained on demos_v2 via anvil-trainer
+# (2026-09-29), not a HIL-SERL SAC policy.
+#
+# This does NOT run the actor/learner gRPC loop at all -- run_policy_eval.py
+# is a much simpler standalone script (make_robot_env + make_processors +
+# make_policy + a plain step loop), since ACT needs no replay buffer, no
+# critic, no online training. The leader arm / space-bar intervention still
+# works exactly as before (same InterventionActionProcessorStep pipeline) --
+# it's the safety override and episode-labeling mechanism, unchanged.
+#
+# Usage:
+#   ros2 run lerobot_control hilserl_eval_policy --config_path configs/hilserl/eval_act_push_bottle.yaml
+#
+# Why this task/policy pairing exists: BC+DAgger (SAC's small reactive actor,
+# see train_rl_push_bottle.yaml's own history) plateaued around 40-55%
+# intervention rate despite 3 correction rounds and real RL, and offline
+# diagnostics point at compounding error from a per-step, non-chunked
+# architecture as the likely cause -- see the plan file's "is our setup
+# correct" investigation. ACT's chunking+temporal-ensembling is the direct,
+# cheap test of that diagnosis on a task simple enough (fixed home start,
+# fixed two-point push) that it should be solvable outright if the
+# diagnosis is right.
+
+env:
+  type: gym_manipulator
+  name: real_robot
+  fps: 10
+
+  features:
+    state:
+      type: STATE
+      shape: [7]
+    wrist_r_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    ee_delta_action:
+      type: ACTION
+      shape: [3]
+  features_map:
+    state: observation.state
+    wrist_r_image: observation.images.wrist_r
+    ee_delta_action: action
+
+  robot:
+    type: anvil_openarm_follower
+    ros_prefix: follower_r
+    joint_state_topic: /joint_states
+    command_topic: /follower_r_forward_position_controller/commands
+    num_joints: 7
+    camera_topics:
+      wrist_r: /cam_wrist_r/image_raw/compressed
+    control_frequency: 10.0
+    max_position_delta: 0.08
+    max_command_step_rad: 0.06
+    obs_timeout_s: 2.0
+
+  teleop:
+    type: anvil_openarm_leader
+    ros_prefix: leader_r
+    joint_state_topic: /joint_states
+    num_joints: 7
+    urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+    target_frame_name: leader_r_hand_tcp
+    step_sizes:
+      x: 0.02
+      y: 0.02
+      z: 0.02
+    obs_timeout_s: 2.0
+    policy_controller: follower_r_forward_position_controller
+    teleop_controller: teleop_controller
+    follower_command_topic: /follower_r_forward_position_controller/commands
+    follower_joint_prefix: follower_r
+
+  processor:
+    control_mode: leader
+
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false
+      display_cameras: false
+
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+
+    gripper:
+      use_gripper: false
+
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 18.0
+      control_time_s: 20.0
+      terminate_on_success: true
+
+    inverse_kinematics:
+      urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+      target_frame_name: follower_r_hand_tcp
+      end_effector_bounds:
+        min: [-0.0247, -0.4427, 0.1117]
+        max: [0.4159, 0.0418, 0.40]
+      end_effector_step_sizes:
+        x: 0.02
+        y: 0.02
+        z: 0.02
+
+    reward_classifier: null
+
+policy:
+  type: act
+  chunk_size: 50
+  n_action_steps: 30
+  normalization_mapping:
+    ACTION: MEAN_STD
+    STATE: MEAN_STD
+    VISUAL: IDENTITY
+  # Mount the trained checkpoint's dir at this exact container path via
+  # `-v .../outputs/push_bottle_policy_act_poc/checkpoints/<step>/pretrained_model:/workspace/configs/hilserl/act_push_bottle_poc:ro`
+  pretrained_path: /workspace/configs/hilserl/act_push_bottle_poc
+  device: cuda
+  push_to_hub: false
+
+output_dir: outputs/hilserl_push_bottle_act_eval
+job_name: hilserl_push_bottle_act_eval
+seed: 42
+batch_size: 16
+save_checkpoint: false
+save_freq: 999999999
+wandb:
+  enable: false
