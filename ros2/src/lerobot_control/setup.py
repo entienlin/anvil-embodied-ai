@@ -42,6 +42,7 @@ setup(
             "hilserl_bc_pretrain = lerobot_control.hilserl.bc_pretrain:main",
             "hilserl_eval_checkpoint = lerobot_control.hilserl.eval_checkpoint:main",
             "hilserl_eval_policy = lerobot_control.hilserl.run_policy_eval:main",
+            "hilserl_replay_actions = lerobot_control.hilserl.run_action_replay:main",
         ],
     },
 )
