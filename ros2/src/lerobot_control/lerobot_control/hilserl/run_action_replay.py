@@ -23,15 +23,26 @@ problem is in what the models learned to predict. If replay ALSO fails or
 looks wrong, the deployment/action-processing pipeline itself is the bug,
 and no amount of retraining either model would ever fix it.
 
-Usage:
+Usage -- replay one specific saved episode:
     REPLAY_ACTIONS_NPZ=/path/to/episode.npz \
     ros2 run lerobot_control hilserl_replay_actions --config_path <path>
+
+Usage -- "replay right away": replay the most recent successful episode in
+a directory (e.g. the same one a just-finished hilserl_actor/hilserl_eval_
+policy session was writing to via -e HILSERL_TRAJ_DIR=...):
+    REPLAY_EPISODE_DIR=/workspace/outputs/some_session \
+    ros2 run lerobot_control hilserl_replay_actions --config_path <path>
+No extra recording step needed -- every actor/eval session already saves
+one ep_*.npz per episode (save_actor_trajectory() in patches.py); this
+just finds the newest one with reward>0 and replays its "action" array.
 
 The npz must have one array, "action", shape (N, 3) -- exactly
 lerobot_control.hilserl.bc_pretrain's/demos_v2's raw recorded action
 convention (delta_x/delta_y/delta_z multipliers, NOT clipped to [-1,1] --
 same as what a live human's raw teleop produces, so no special-casing is
-needed relative to a real intervention).
+needed relative to a real intervention). Both save_actor_trajectory()'s
+episode files and a demos_v2-derived extraction (ds[i]["action"]) already
+match this shape.
 """
 
 import logging
@@ -41,6 +52,24 @@ from lerobot_control.hilserl import robot_anvil_openarm  # noqa: F401 -- registr
 from lerobot_control.hilserl import teleop_anvil_openarm_leader  # noqa: F401 -- registration side effect
 
 
+def _find_latest_successful_episode(episode_dir: str) -> str:
+    """The "replay right away" path: every hilserl_actor/hilserl_eval_policy session
+    already saves one ep_*.npz per episode (save_actor_trajectory() in patches.py),
+    filenames timestamp-sorted, each with a real "reward" array -- no new recording
+    infrastructure needed, just point REPLAY_EPISODE_DIR at the same directory
+    -e HILSERL_TRAJ_DIR/--config_path pointed the session at and rerun this script."""
+    import glob
+
+    import numpy as np
+
+    candidates = sorted(glob.glob(os.path.join(episode_dir, "ep_*.npz")))
+    for path in reversed(candidates):  # most recent first
+        z = np.load(path)
+        if float(z["reward"].sum()) > 0:
+            return path
+    raise RuntimeError(f"No successful (reward>0) episode found in {episode_dir} ({len(candidates)} episodes checked).")
+
+
 def run_action_replay(cfg) -> None:
     import numpy as np
     import torch
@@ -48,14 +77,30 @@ def run_action_replay(cfg) -> None:
     from lerobot.types import TransitionKey
 
     npz_path = os.environ.get("REPLAY_ACTIONS_NPZ")
-    if not npz_path:
-        raise RuntimeError("REPLAY_ACTIONS_NPZ env var must point to a saved episode's action array (see this module's docstring).")
+    episode_dir = os.environ.get("REPLAY_EPISODE_DIR")
+    if npz_path:
+        pass
+    elif episode_dir:
+        npz_path = _find_latest_successful_episode(episode_dir)
+        print(f"[REPLAY] REPLAY_EPISODE_DIR set -- auto-selected the most recent successful "
+              f"(reward>0) episode: {npz_path}", flush=True)
+    else:
+        raise RuntimeError(
+            "Set either REPLAY_ACTIONS_NPZ (a specific episode's action array) or "
+            "REPLAY_EPISODE_DIR (a directory of ep_*.npz files -- e.g. the same "
+            "HILSERL_TRAJ_DIR an actor session just wrote to -- to auto-replay its "
+            "latest successful episode). See this module's docstring."
+        )
     actions = np.load(npz_path)["action"]
     print(f"[REPLAY] loaded {len(actions)} recorded actions from {npz_path}", flush=True)
 
     # How many leading steps to print full pipeline detail for -- HILSERL_REPLAY_DEBUG_STEPS=0
-    # disables this and prints only the summary line every 20 steps (the original behavior).
-    debug_steps = int(os.environ.get("HILSERL_REPLAY_DEBUG_STEPS", "15"))
+    # disables this and prints only the summary line every 20 steps. Defaults to the whole
+    # episode: episodes here are short (~90-200 steps) and a real demo's motion doesn't
+    # necessarily start at step 0 (idle lead-in before the human starts moving, as episode 0
+    # of demos_v2 turned out to have for its first 15+ steps) -- a truncated debug window can
+    # silently show only the idle segment and look uninformative for the wrong reason.
+    debug_steps = int(os.environ.get("HILSERL_REPLAY_DEBUG_STEPS", str(len(actions))))
 
     logging.info("[REPLAY] make_env")
     env, teleop_device = make_robot_env(cfg=cfg.env)
