@@ -663,6 +663,86 @@ def patch_learner_episode_stats_logging() -> None:
     learner_mod.process_interaction_message = _process_interaction_message
 
 
+def patch_sac_actor_warmup() -> None:
+    """First real-RL session (2026-09-29, BC v8 -> RL, 1500 steps,
+    online_step_before_learning=10): the policy came back measurably WORSE
+    -- intervention rate rose to ~0.54 (vs the ~0.39-0.50 BC/DAgger-only
+    plateau) -- the very first time gradient updates were ever allowed to
+    run for real. Directly ruled out the temperature freeze as the cause:
+    the saved step-1500 checkpoint's log_alpha is bit-identical to
+    temperature_init (-4.605170249938965 == log(0.01)), so
+    patch_sac_freeze_temperature() held throughout.
+
+    Matches this project's own much older offline diagnostic exactly
+    (see the plan's "offline learning-health diagnostics" section): the
+    critic is the only source of the actor's improvement signal
+    (compute_loss_actor = temp*logpi - min_Q(s,pi(s))), Adam gives a
+    full-size step regardless of how reliable that gradient is, and with
+    online_step_before_learning=10 the actor starts moving after about
+    one second of real data -- a critic that's had ~zero real calibration
+    yet. The actor DOES move, just in a noisy, uninformed direction, drifting
+    away from a BC start that was already decent. This was flagged as a
+    follow-up back when A (deterministic inference) + B (frozen
+    temperature) were first added ("do only if A+B aren't enough") --
+    today's session is the first real evidence they aren't.
+
+    Fix: let the critic train against real transitions for
+    HILSERL_ACTOR_WARMUP_STEPS actor-update opportunities before the actor
+    optimizer is allowed to take its first step. compute_loss_actor/
+    .backward() still run every time (cheap, keeps the graph/optimizer
+    state exercised) -- only optimizers["actor"].step() is skipped, so no
+    autograd/requires_grad surgery and no risk of the same
+    "loss becomes non-differentiable" crash class the temperature fix had
+    to avoid. Critic/discrete_critic/temperature optimizers are completely
+    untouched.
+
+    Opt-in via HILSERL_ACTOR_WARMUP_STEPS (default 0 = off, i.e. today's
+    exact prior behavior) rather than always-on -- this is a new, only
+    offline-reasoned idea, never validated even in a fake-hardware run
+    yet, and every other lever pulled during real-RL sessions in this
+    project has been introduced as an explicit opt-in first.
+    """
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_actor_warmup_patched", False):
+        return
+    learner_mod._anvil_actor_warmup_patched = True
+
+    import os as _os
+
+    warmup_steps = int(_os.environ.get("HILSERL_ACTOR_WARMUP_STEPS", "0"))
+    if warmup_steps <= 0:
+        return
+
+    orig_make = learner_mod.make_optimizers_and_scheduler
+
+    def _make(cfg, policy):
+        optimizers, lr_scheduler = orig_make(cfg, policy)
+        actor_opt = optimizers.get("actor")
+        if actor_opt is not None:
+            orig_step = actor_opt.step
+            state = {"n": 0}
+
+            def _step(*a, **kw):
+                state["n"] += 1
+                if state["n"] <= warmup_steps:
+                    if state["n"] == warmup_steps:
+                        print(
+                            f"[LEARNER-DBG] actor warm-up done after {warmup_steps} "
+                            "critic-only updates -- actor optimizer now stepping.",
+                            flush=True,
+                        )
+                    return None  # critic-only warm-up: skip this actor update
+                return orig_step(*a, **kw)
+
+            actor_opt.step = _step
+        return optimizers, lr_scheduler
+
+    learner_mod.make_optimizers_and_scheduler = _make
+
+
 def patch_robot_env_step_keeps_intervention_flag() -> None:
     """Found 2026-09-24 while adding per-episode intervention-rate logging:
     the rate read 0.0 in every episode even though the operator was
@@ -729,6 +809,7 @@ def apply_all_patches() -> None:
     patch_learner_stop_at_online_steps()
     patch_sac_deterministic_inference()
     patch_sac_freeze_temperature()
+    patch_sac_actor_warmup()
     patch_learner_episode_stats_logging()
     patch_robot_env_step_keeps_intervention_flag()
     patch_intervention_flag_in_complementary_info()
