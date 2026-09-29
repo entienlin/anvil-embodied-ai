@@ -118,14 +118,19 @@ env:
 
     reward_classifier: null
 
-# Real 5-episode/626-frame demo dataset from Stage 5 (env_push_bottle.yaml's
-# recording run). root is a container-internal path -- mount the HOST
-# directory that actually holds it (data/datasets/push_bottle_demos) at
-# this exact path via `-v .../data/datasets/push_bottle_demos:/tmp/push_bottle_demos:ro`
-# (read-only: the learner only ever reads this dataset, never writes to it).
+# 2026-09-29: switched from the original 5-episode/626-frame Stage-5 demo set
+# to demos_v2 (40 clean successful episodes/3150 frames, recorded from the
+# homed start -- the same dataset BC v5 onward pretrains on) now that real RL
+# training is finally being turned on: this is the RLPD offline half of the
+# 50/50 mix once online_step_before_learning passes, so it should be at least
+# as good/large as whatever BC already trains on, not the older, much smaller
+# set. root is a container-internal path -- mount the HOST directory that
+# actually holds it (data/datasets/_recordings/demos_v2) at this exact path
+# via `-v .../data/datasets/_recordings/demos_v2:/tmp/demos_v2:ro` (read-only:
+# the learner only ever reads this dataset, never writes to it).
 dataset:
-  repo_id: SSTC-AITeam/hilserl-push-bottle
-  root: /tmp/push_bottle_demos
+  repo_id: SSTC-AITeam/hilserl-push-bottle-demos-v2
+  root: /tmp/demos_v2
   # Default video_backend (torchcodec) fails to load in this image --
   # missing libavutil.so.* (FFmpeg shared libs never installed here, this
   # image only needed video ENCODING via LeRobotDataset.create(), not
@@ -180,7 +185,13 @@ policy:
   # Held-out demo corr +0.765 (the gate only covers demo frames, not the corrections).
   # 2026-09-24: BC v7 = demos + round-1 and round-2 DAgger corrections (BC v6 drove round 2:
   # 14 episodes, 10 successes, intervention rate still 0.3-0.57). Held-out demo corr +0.767.
-  pretrained_path: /workspace/configs/hilserl/bc_pretrained_v7
+  # 2026-09-29: BC v8 = demos + all three DAgger rounds (round-3: BC v7 drove, 10 episodes,
+  # 8 successes). Held-out demo corr +0.760 -- statistically flat vs v6/v7, and intervention
+  # rate has stayed ~0.4-0.5 across all three rounds: BC/DAgger alone has plateaued. This is
+  # the last BC-only checkpoint before actually turning RL on (online_step_before_learning
+  # left at its real default below for the first time -- every prior real session forced it
+  # to 100000 via a CLI override specifically to isolate BC's own progress).
+  pretrained_path: /workspace/configs/hilserl/bc_pretrained_v8
   device: cuda
   push_to_hub: false
   # 2026-09-24: official HIL-SERL docs (huggingface.co/docs/lerobot/en/hilserl,
@@ -214,13 +225,20 @@ policy:
   # bootstrapping. This run is the direct test of whether "just needs more
   # training" (not reward sparsity itself) is the real bottleneck -- see
   # the plan's "Strategic question" section.
-  online_steps: 4000  # ~30-40 episodes at this task's length
-  online_step_before_learning: 10  # start mixing in demo data almost immediately
+  online_steps: 4000  # ~30-40 episodes at this task's length; first real-RL attempt (2026-09-29) overrides this down to 1500 on the command line
+  online_step_before_learning: 10  # start mixing in demo data almost immediately -- 2026-09-29: first session this is actually allowed to take effect (no more --policy.online_step_before_learning=100000 override)
   # SAC entropy bonus at the default temperature_init=1.0 blew the BC actor's std back up to the 0.5 cap within 250 steps
   # (sampling std 0.02 -> 0.5, error vs demos 0.045 -> 0.2 on checkpoints 250/500/1000). Start with a small temperature.
+  # Frozen to 0 gradient by patch_sac_freeze_temperature() regardless -- temperature_init is now a real, permanent
+  # value for the whole run, not just a starting point. With it this small, compute_loss_actor's entropy term is
+  # negligible, so the actor's gradient is close to pure Q-maximization -- exactly what real RL training needs here.
   temperature_init: 0.01
   online_buffer_capacity: 2000
-  offline_buffer_capacity: 2000
+  # 2026-09-29: 2000 -> 4000 -- demos_v2 (3150 frames) replaced the original 626-frame demo
+  # set above; ReplayBuffer.from_lerobot_dataset(..., capacity=offline_buffer_capacity)
+  # (lerobot/rl/learner.py:1003-1011) truncates the offline dataset to this many frames, so
+  # 2000 would have silently dropped over a third of the clean demo set from the RLPD mix.
+  offline_buffer_capacity: 4000
   actor_learner_config:
     learner_host: 127.0.0.1
     learner_port: 50051
