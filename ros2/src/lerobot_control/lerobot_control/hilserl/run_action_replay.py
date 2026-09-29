@@ -44,7 +44,7 @@ from lerobot_control.hilserl import teleop_anvil_openarm_leader  # noqa: F401 --
 def run_action_replay(cfg) -> None:
     import numpy as np
     import torch
-    from lerobot.rl.gym_manipulator import create_transition, make_processors, make_robot_env, step_env_and_process_transition
+    from lerobot.rl.gym_manipulator import create_transition, make_processors, make_robot_env
     from lerobot.types import TransitionKey
 
     npz_path = os.environ.get("REPLAY_ACTIONS_NPZ")
@@ -52,6 +52,10 @@ def run_action_replay(cfg) -> None:
         raise RuntimeError("REPLAY_ACTIONS_NPZ env var must point to a saved episode's action array (see this module's docstring).")
     actions = np.load(npz_path)["action"]
     print(f"[REPLAY] loaded {len(actions)} recorded actions from {npz_path}", flush=True)
+
+    # How many leading steps to print full pipeline detail for -- HILSERL_REPLAY_DEBUG_STEPS=0
+    # disables this and prints only the summary line every 20 steps (the original behavior).
+    debug_steps = int(os.environ.get("HILSERL_REPLAY_DEBUG_STEPS", "15"))
 
     logging.info("[REPLAY] make_env")
     env, teleop_device = make_robot_env(cfg=cfg.env)
@@ -62,20 +66,63 @@ def run_action_replay(cfg) -> None:
     action_processor.reset()
     transition = env_processor(create_transition(observation=obs, info=info))
 
+    def _joint_pos(observation: dict) -> dict:
+        return {k: round(float(v), 2) for k, v in observation.items() if isinstance(k, str) and k.endswith(".pos")}
+
     print(f"[REPLAY] starting -- replaying {len(actions)} recorded steps verbatim, no policy involved", flush=True)
+    if debug_steps:
+        print(f"[REPLAY] joints BEFORE step 0: {_joint_pos(transition[TransitionKey.OBSERVATION])}", flush=True)
 
     reward_sum = 0.0
     step_i = 0
     try:
         for step_i, raw_action in enumerate(actions):
             action = torch.as_tensor(raw_action, dtype=torch.float32)
-            transition = step_env_and_process_transition(
-                env=env,
-                transition=transition,
-                action=action,
-                env_processor=env_processor,
-                action_processor=action_processor,
+
+            # Inlined from lerobot.rl.gym_manipulator.step_env_and_process_transition() --
+            # only difference from calling it directly is the debug print of
+            # `processed_action` (the FINAL command about to reach env.step() ->
+            # AnvilOpenArmFollower.send_action()) and the observed joint state right
+            # before/after, so a "nothing moved" run shows exactly where the signal
+            # disappeared: computed-as-near-zero upstream (IK/enabled/EE-bounds), or
+            # computed correctly but not reaching the real motors.
+            transition[TransitionKey.ACTION] = action
+            joints_before = _joint_pos(transition[TransitionKey.OBSERVATION])
+            transition[TransitionKey.OBSERVATION] = (
+                env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
             )
+            processed_action_transition = action_processor(transition)
+            processed_action = processed_action_transition[TransitionKey.ACTION]
+
+            if step_i < debug_steps:
+                # MapDeltaActionToRobotActionStep's own "enabled" test (position_magnitude >
+                # noise_threshold=1e-3), recomputed here since "enabled" itself is consumed
+                # internally by EEReferenceAndDelta and not visible on the transition afterward.
+                position_magnitude = float(np.linalg.norm(raw_action[:3]))
+                print(
+                    f"[REPLAY-DEBUG] step {step_i}: raw_action={np.round(raw_action, 4).tolist()} "
+                    f"position_magnitude={position_magnitude:.4f} (enabled if > 1e-3) "
+                    f"processed_action(-> env.step)={processed_action} joints_before={joints_before}",
+                    flush=True,
+                )
+
+            step_obs, step_reward, terminated, truncated, step_info = env.step(processed_action)
+            joints_after = _joint_pos(step_obs)
+            if step_i < debug_steps:
+                print(f"[REPLAY-DEBUG] step {step_i}: joints_after ={joints_after}", flush=True)
+
+            reward = step_reward + processed_action_transition[TransitionKey.REWARD]
+            terminated = terminated or processed_action_transition[TransitionKey.DONE]
+            truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
+            complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
+            new_info = processed_action_transition[TransitionKey.INFO].copy()
+            new_info.update(step_info)
+            transition = create_transition(
+                observation=step_obs, action=processed_action, reward=reward, done=terminated,
+                truncated=truncated, info=new_info, complementary_data=complementary_data,
+            )
+            transition = env_processor(transition)
+
             reward = float(transition[TransitionKey.REWARD])
             reward_sum += reward
             done = transition.get(TransitionKey.DONE, False)
