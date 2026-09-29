@@ -379,6 +379,41 @@ def patch_robot_env_reset_to_home_via_arms_resetter() -> None:
     RobotEnv._anvil_reset_home_patch_applied = True
 
 
+def patch_leader_skip_reset_when_stopping() -> None:
+    """Once an auto-stop has been requested (_request_stop(), e.g.
+    HILSERL_MAX_EPISODES reached), the actor's very next line is still
+    going to call online_env.reset() for an episode that will never
+    actually run -- lerobot's act_with_policy() has no concept of "about
+    to stop" and always resets immediately after pushing the just-ended
+    episode's transitions (see _request_stop()'s docstring for the crash
+    this caused on real hardware). Rather than let that reset race our own
+    shutdown, skip the real homing entirely once stopping: no
+    switch_to_teleop()/arms_resetter call, no ROS traffic at all, just
+    leave the arm exactly where forward_position_controller already holds
+    it. That's the same end state a plain Ctrl+C between episodes already
+    leaves today -- not a new risk, just made reliable instead of racy.
+    """
+    from .teleop_anvil_openarm_leader import AnvilOpenArmLeader
+
+    if getattr(AnvilOpenArmLeader, "_anvil_skip_reset_patched", False):
+        return
+    AnvilOpenArmLeader._anvil_skip_reset_patched = True
+
+    orig = AnvilOpenArmLeader.perform_episode_reset_and_wait
+
+    def _reset_or_skip(self, timeout_s=15.0, before_homing=None, after_homed=None):
+        if _auto_stop_state.get("stop_requested"):
+            print(
+                "[AnvilOpenArmLeader] stop already requested -- skipping the real homing "
+                "reset for this (about to be discarded) episode; holding the arm as-is.",
+                flush=True,
+            )
+            return
+        return orig(self, timeout_s=timeout_s, before_homing=before_homing, after_homed=after_homed)
+
+    AnvilOpenArmLeader.perform_episode_reset_and_wait = _reset_or_skip
+
+
 def patch_sac_deterministic_inference() -> None:
     """SAC session (2026-09-22): user reported policy motion is "a bit
     shaky (not smooth, but not the rapid shaky movement that leads to
@@ -514,7 +549,7 @@ def patch_sac_freeze_temperature() -> None:
 _episode_stats_state: dict = {"path": None}
 
 
-_auto_stop_state = {"episodes": 0}
+_auto_stop_state = {"episodes": 0, "stop_requested": False}
 
 
 def _max_episodes() -> int:
@@ -530,7 +565,23 @@ def _max_episodes() -> int:
 
 
 def _request_stop(who: str, n: int, delay_s: float = 0.0) -> None:
-    """SIGINT ourselves = the same clean shutdown path as pressing Ctrl+C."""
+    """SIGINT ourselves = the same clean shutdown path as pressing Ctrl+C.
+
+    Sets stop_requested immediately (before any delay/signal) -- see
+    patch_leader_skip_reset_when_stopping() below, which reads it to avoid
+    a real hardware crash: act_with_policy() calls online_env.reset() for
+    the next (about-to-be-discarded) episode on the very next line after
+    the Nth episode's transitions are pushed, with no check of its own for
+    any stop condition. That reset does real ROS service calls (switch
+    controller, home via arms_resetter) that take seconds -- exactly the
+    window our own SIGINT's shutdown teardown lands in, guaranteed every
+    time since there's no gap between "episode N done" and "reset() for
+    N+1 starts". First hit 2026-09-29 (round-3 DAgger): the actor crashed
+    with `arms_resetter did not report 'homed'` right after saving its
+    10th and last episode, because the reset for a would-be 11th episode
+    started and lost its ROS context mid-call.
+    """
+    _auto_stop_state["stop_requested"] = True
     import os as _os
     import signal as _signal
     import threading as _threading
@@ -672,6 +723,7 @@ def apply_all_patches() -> None:
     patch_inverse_kinematics_to_always_reseed_from_real_joints()
     patch_robot_env_reset_to_keep_publishing()
     patch_robot_env_reset_to_home_via_arms_resetter()
+    patch_leader_skip_reset_when_stopping()
     patch_train_pipeline_config_validate_for_optional_dataset()
     patch_learner_progress_visibility()
     patch_learner_stop_at_online_steps()
