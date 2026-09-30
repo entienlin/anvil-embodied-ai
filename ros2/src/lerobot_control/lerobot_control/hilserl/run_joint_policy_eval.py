@@ -83,6 +83,10 @@ def run_joint_policy_eval(cfg) -> None:
             observation = {k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in input_keys}
             with torch.no_grad():
                 action = policy.select_action(batch=observation)
+            # AnvilOpenArmFollower.send_action() indexes into this with plain Python floats
+            # (action[f"{j}.pos"] -> np.array(...)) -- needs a CPU tensor, unlike the SAC actor
+            # path which already ran on whatever device cfg.policy.device set (usually cpu there).
+            action = action.detach().cpu()
             raw_action = action.squeeze(0) if action.dim() > 1 else action
 
             obs, reward, terminated, truncated, info = env.step(raw_action)
