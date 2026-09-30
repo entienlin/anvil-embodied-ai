@@ -36,6 +36,11 @@ Usage -- same env vars as hilserl_replay_actions, but reads "state_deg"
 or
     REPLAY_EPISODE_DIR=/workspace/outputs/some_session \
     ros2 run lerobot_control hilserl_replay_joints --config_path <path>
+
+Add REPLAY_TRACE_OUT=/path/to/trace.npz to save a full per-step trace
+(arrays "target"/"before"/"after", each (N, 7) degrees) for offline
+analysis -- saved even on a crash or early stop, so a partial run's data
+isn't lost either.
 """
 
 import logging
@@ -82,6 +87,9 @@ def run_joint_replay(cfg) -> None:
           "watching the arm, not by the printed reward.", flush=True)
     print(f"[JOINT-REPLAY] joints BEFORE step 0: {_joint_pos(obs)}", flush=True)
 
+    trace_path = os.environ.get("REPLAY_TRACE_OUT")
+    trace_target, trace_before, trace_after = [], [], []
+
     dt = 1.0 / cfg.env.fps
     step_i = 0
     try:
@@ -91,6 +99,10 @@ def run_joint_replay(cfg) -> None:
             joints_before = _joint_pos(obs)
             obs, reward, terminated, truncated, info = env.step(action)
             joints_after = _joint_pos(obs)
+            if trace_path:
+                trace_target.append(np.asarray(joint_deg, dtype=np.float64))
+                trace_before.append(np.array([joints_before[f"follower_r_joint{i}.pos"] for i in range(1, 8)]))
+                trace_after.append(np.array([joints_after[f"follower_r_joint{i}.pos"] for i in range(1, 8)]))
             if step_i % 10 == 0 or reward:
                 print(f"[JOINT-REPLAY] step {step_i}/{len(states)} reward={float(reward)} "
                       f"target={np.round(joint_deg, 2).tolist()} before={joints_before} after={joints_after}",
@@ -104,6 +116,16 @@ def run_joint_replay(cfg) -> None:
         print(f"[JOINT-REPLAY] stopped early by Ctrl+C at step {step_i}.", flush=True)
     finally:
         print(f"[JOINT-REPLAY] finished at step {step_i}.", flush=True)
+        if trace_path and trace_target:
+            # Saved even on a crash/early stop -- whatever ran is still worth analyzing offline,
+            # rather than depending on scrolling console text or losing a partial run entirely.
+            np.savez(
+                trace_path,
+                target=np.stack(trace_target),
+                before=np.stack(trace_before),
+                after=np.stack(trace_after),
+            )
+            print(f"[JOINT-REPLAY] saved {len(trace_target)}-step trace (target/before/after, degrees) to {trace_path}", flush=True)
         if hasattr(env, "close"):
             env.close()
 
