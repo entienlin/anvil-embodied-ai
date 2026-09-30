@@ -71,10 +71,13 @@ def _find_latest_successful_episode(episode_dir: str) -> str:
 
 
 def run_action_replay(cfg) -> None:
+    import time
+
     import numpy as np
     import torch
     from lerobot.rl.gym_manipulator import create_transition, make_processors, make_robot_env
     from lerobot.types import TransitionKey
+    from lerobot.utils.robot_utils import precise_sleep
 
     npz_path = os.environ.get("REPLAY_ACTIONS_NPZ")
     episode_dir = os.environ.get("REPLAY_EPISODE_DIR")
@@ -118,10 +121,22 @@ def run_action_replay(cfg) -> None:
     if debug_steps:
         print(f"[REPLAY] joints BEFORE step 0: {_joint_pos(transition[TransitionKey.OBSERVATION])}", flush=True)
 
+    # gym_manipulator.py's own control_loop() paces every real step to dt=1/fps
+    # (precise_sleep(max(dt - elapsed, 0.0)) at the end of each tick) -- this loop had
+    # no such pacing at all, so it ran flat-out at whatever speed the pipeline allowed
+    # (no camera-capture wait, no policy-inference delay) instead of at the real control
+    # rate. Result (found 2026-09-30): a ~13s real episode replayed in a couple of
+    # seconds -- correct actions, wrong speed, looking "extremely short"/rushed. This
+    # also matters for physical correctness, not just appearances: EEReferenceAndDelta's
+    # delta is a per-TICK step size, so replaying the same deltas faster than they were
+    # recorded doesn't just look fast, it commands a faster real end-effector velocity
+    # than the demo actually had.
+    dt = 1.0 / cfg.env.fps
     reward_sum = 0.0
     step_i = 0
     try:
         for step_i, raw_action in enumerate(actions):
+            step_start_time = time.perf_counter()
             action = torch.as_tensor(raw_action, dtype=torch.float32)
 
             # Inlined from lerobot.rl.gym_manipulator.step_env_and_process_transition() --
@@ -174,6 +189,9 @@ def run_action_replay(cfg) -> None:
             truncated = transition.get(TransitionKey.TRUNCATED, False)
             if step_i % 20 == 0 or reward:
                 print(f"[REPLAY] step {step_i}/{len(actions)} reward={reward} cumulative={reward_sum}", flush=True)
+
+            precise_sleep(max(dt - (time.perf_counter() - step_start_time), 0.0))
+
             if done or truncated:
                 print(f"[REPLAY] episode ended early at step {step_i} (done={bool(done)} truncated={bool(truncated)})", flush=True)
                 break
