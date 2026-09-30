@@ -44,6 +44,7 @@ setup(
             "hilserl_eval_policy = lerobot_control.hilserl.run_policy_eval:main",
             "hilserl_replay_actions = lerobot_control.hilserl.run_action_replay:main",
             "hilserl_replay_joints = lerobot_control.hilserl.run_joint_replay:main",
+            "hilserl_eval_joint_policy = lerobot_control.hilserl.run_joint_policy_eval:main",
         ],
     },
 )

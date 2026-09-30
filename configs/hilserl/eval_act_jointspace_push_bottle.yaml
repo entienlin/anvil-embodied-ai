@@ -1,0 +1,128 @@
+# =============================================================================
+# ACT (joint-space) eval, single-arm push-bottle task
+# =============================================================================
+# Same robot/teleop wiring as eval_act_push_bottle.yaml (real-hardware-
+# validated safety bounds, limiter, IK-reseed fix, homing reset), but the
+# `processor:` EE-delta/IK section is UNUSED here -- run_joint_policy_eval.py
+# bypasses action_processor entirely and commands the policy's raw joint
+# output straight to env.step(), the same way hilserl_replay_joints does.
+# It's kept in this file only because HILSerlRobotEnvConfig requires it to
+# parse; nothing in it is ever exercised by this eval path.
+#
+# `features`/`features_map` below matches the joint-space-relabeled dataset
+# (demos_v2_jointspace, see relabel_joint_space.py in the plan/session
+# history) that BC v9/ACT-jointspace trains on: action = the follower's own
+# next-tick observation.state (degrees), not an EE-delta.
+#
+# Why this exists (2026-09-30): the original 3-dim EE-delta action column
+# was confirmed derived from the LEADER arm's motion, not the follower's
+# actual observed motion (0.5-0.7 correlation, 2-3x magnitude mismatches)
+# -- every model trained on it (BC, DAgger, SAC/RL, ACT) learned to
+# reproduce a label that didn't match what the robot really did. Direct
+# joint-space replay of the follower's own real states was the only thing
+# that reproduced the real trajectory tonight. This config is for the ACT
+# model retrained on that corrected, joint-space-native data.
+
+env:
+  type: gym_manipulator
+  name: real_robot
+  fps: 10
+
+  features:
+    state:
+      type: STATE
+      shape: [7]
+    wrist_r_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    joint_action:
+      type: ACTION
+      shape: [7]
+  features_map:
+    state: observation.state
+    wrist_r_image: observation.images.wrist_r
+    joint_action: action
+
+  robot:
+    type: anvil_openarm_follower
+    ros_prefix: follower_r
+    joint_state_topic: /joint_states
+    command_topic: /follower_r_forward_position_controller/commands
+    num_joints: 7
+    camera_topics:
+      wrist_r: /cam_wrist_r/image_raw/compressed
+    control_frequency: 10.0
+    max_position_delta: 0.08
+    max_command_step_rad: 0.06
+    obs_timeout_s: 2.0
+
+  teleop:
+    type: anvil_openarm_leader
+    ros_prefix: leader_r
+    joint_state_topic: /joint_states
+    num_joints: 7
+    urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+    target_frame_name: leader_r_hand_tcp
+    step_sizes:
+      x: 0.02
+      y: 0.02
+      z: 0.02
+    obs_timeout_s: 2.0
+    policy_controller: follower_r_forward_position_controller
+    teleop_controller: teleop_controller
+    follower_command_topic: /follower_r_forward_position_controller/commands
+    follower_joint_prefix: follower_r
+
+  processor:
+    # Unused by run_joint_policy_eval.py (see header) -- present only
+    # because HILSerlRobotEnvConfig requires a processor block to parse.
+    control_mode: leader
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false
+      display_cameras: false
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+    gripper:
+      use_gripper: false
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 18.0
+      control_time_s: 20.0
+      terminate_on_success: true
+    inverse_kinematics:
+      urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+      target_frame_name: follower_r_hand_tcp
+      end_effector_bounds:
+        min: [-0.0247, -0.4427, 0.1117]
+        max: [0.4159, 0.0418, 0.40]
+      end_effector_step_sizes:
+        x: 0.02
+        y: 0.02
+        z: 0.02
+    reward_classifier: null
+
+policy:
+  type: act
+  chunk_size: 50
+  n_action_steps: 30
+  normalization_mapping:
+    ACTION: MEAN_STD
+    STATE: MEAN_STD
+    VISUAL: IDENTITY
+  # Mount the trained checkpoint's dir at this exact container path via
+  # `-v .../outputs/push_bottle_policy_act_jointspace/checkpoints/<step>/pretrained_model:/workspace/configs/hilserl/act_jointspace_poc:ro`
+  pretrained_path: /workspace/configs/hilserl/act_jointspace_poc
+  device: cuda
+  push_to_hub: false
+
+output_dir: outputs/hilserl_push_bottle_act_jointspace_eval
+job_name: hilserl_push_bottle_act_jointspace_eval
+seed: 42
+batch_size: 16
+save_checkpoint: false
+save_freq: 999999999
+wandb:
+  enable: false
