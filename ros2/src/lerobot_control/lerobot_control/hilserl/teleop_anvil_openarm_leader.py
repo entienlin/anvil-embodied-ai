@@ -117,6 +117,10 @@ class AnvilOpenArmLeader(Teleoperator):
         self._was_intervening = False
         self._leader_ee_ref: np.ndarray | None = None  # reset each time intervention (re)starts
         self._pending_switch_retries = 0  # see get_action()'s switch-failure handling
+        # True from the moment a reset hands the arm to teleop_controller until that same
+        # reset confirms "homed" and hands it back -- see perform_episode_reset_and_wait()'s
+        # docstring and disconnect()'s guard below for why this exists.
+        self._reset_in_progress_unsafe = False
 
     # -- Teleoperator ABC ------------------------------------------------
 
@@ -289,6 +293,12 @@ class AnvilOpenArmLeader(Teleoperator):
         if before_homing is not None:
             before_homing()
 
+        # Set BEFORE switching to teleop, cleared only once switch_to_policy() below
+        # actually confirms success -- see disconnect()'s guard for why this exists.
+        # Any exception anywhere in this function (including one raised well after
+        # this point) leaves the flag True, which is exactly the "we don't actually
+        # know it's safe to hand back to policy" state disconnect() must respect.
+        self._reset_in_progress_unsafe = True
         self._switch_client.switch_to_teleop()
 
         if not self._arms_resetter.reset_and_wait(timeout_s=timeout_s):
@@ -307,6 +317,7 @@ class AnvilOpenArmLeader(Teleoperator):
                 "AnvilOpenArmLeader: homing succeeded but re-establishing the "
                 "policy-controlled baseline afterward failed."
             )
+        self._reset_in_progress_unsafe = False
         self._was_intervening = False
         self._leader_ee_ref = None
         # The keyboard toggle persists across episodes (s/f never touch
@@ -496,7 +507,20 @@ class AnvilOpenArmLeader(Teleoperator):
         # run BEFORE stopping the spin thread below -- switch_to_policy()'s
         # call_async() needs it alive to ever resolve, same ordering lesson
         # as connect()'s baseline switch.
-        if self._switch_client is not None:
+        #
+        # EXCEPTION, found 2026-09-30 on real hardware: this must NOT fire
+        # while a reset is mid-flight or just failed (self._reset_in_progress_
+        # unsafe). perform_episode_reset_and_wait() deliberately leaves the
+        # arm on teleop_controller and raises rather than re-engaging policy
+        # control on an unhomed arm -- but that RuntimeError propagates
+        # uncaught up through act_with_policy() to process exit, where THIS
+        # atexit-registered disconnect() used to unconditionally call
+        # switch_to_policy() anyway, silently overriding that safety decision
+        # and handing an unverified, un-homed arm to policy control. Confirmed
+        # live: an arms_resetter timeout left the arm exactly this way --
+        # controller state looked "normal" (forward_position active) but the
+        # arm was never actually homed.
+        if self._switch_client is not None and not self._reset_in_progress_unsafe:
             self._switch_client.switch_to_policy()
 
         self._keyboard.stop()
