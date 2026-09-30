@@ -46,6 +46,7 @@ def run_joint_policy_eval(cfg) -> None:
     from lerobot.utils.random_utils import set_seed
 
     from lerobot_control.hilserl import patches
+    from lerobot_control.hilserl.run_policy_eval import load_policy_processors
 
     logging.info("[JOINT-EVAL] make_env")
     env, teleop_device = make_robot_env(cfg=cfg.env)
@@ -61,6 +62,7 @@ def run_joint_policy_eval(cfg) -> None:
 
     logging.info("[JOINT-EVAL] make_policy")
     policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env).eval()
+    pre_processor, post_processor = load_policy_processors(cfg.policy.pretrained_path, cfg.policy.device)
     input_keys = list(cfg.policy.input_features)
 
     obs, info = env.reset()
@@ -81,8 +83,12 @@ def run_joint_policy_eval(cfg) -> None:
     try:
         while True:
             observation = {k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in input_keys}
+            if pre_processor is not None:
+                observation = pre_processor(observation)
             with torch.no_grad():
                 action = policy.select_action(batch=observation)
+            if post_processor is not None:
+                action = post_processor.process_action(action)
             # AnvilOpenArmFollower.send_action() indexes into this with plain Python floats
             # (action[f"{j}.pos"] -> np.array(...)) -- needs a CPU tensor, unlike the SAC actor
             # path which already ran on whatever device cfg.policy.device set (usually cpu there).

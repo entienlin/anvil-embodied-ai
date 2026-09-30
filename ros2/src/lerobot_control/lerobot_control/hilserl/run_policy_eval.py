@@ -46,6 +46,59 @@ def _max_episodes() -> int:
         return 0
 
 
+def load_policy_processors(pretrained_path, device):
+    """Load the checkpoint's saved pre/post-processor pipelines, exactly the
+    way production inference_node.py does (ModelLoader.load_with_processors())
+    -- NOT something make_policy()/select_action() apply automatically.
+
+    Found the hard way (2026-09-30): a real-hardware ACT run went straight
+    to a wrong, confident target instead of the real task. Checked the raw
+    model output directly against the known-correct target for that exact
+    input: it was sitting in roughly [-1, 1] (normalized space), not real
+    joint degrees. select_action() on the bare policy object never applied
+    the checkpoint's own MEAN_STD normalization/denormalization -- for the
+    EE-delta version this went unnoticed because raw normalized output
+    happens to look like a plausible small EE-delta by coincidence; for
+    joint-space degrees the mismatch is dramatic and immediately visible.
+
+    Returns (preprocessor, postprocessor), either None if the checkpoint
+    has no policy_preprocessor.json/policy_postprocessor.json (a real,
+    loud problem for a MEAN_STD-normalized checkpoint like ours, not a
+    silently-fine default -- callers should treat None as "inference will
+    be wrong", not "no processing needed").
+    """
+    import importlib
+    from pathlib import Path
+
+    from lerobot.processor import PolicyProcessorPipeline
+
+    path = Path(pretrained_path)
+    pre_processor = post_processor = None
+
+    try:
+        importlib.import_module("lerobot.policies.act.processor_act")
+    except ModuleNotFoundError:
+        pass
+
+    if (path / "policy_preprocessor.json").exists():
+        pre_processor = PolicyProcessorPipeline.from_pretrained(str(path), config_filename="policy_preprocessor.json")
+        if hasattr(pre_processor, "to"):
+            pre_processor.to(device)
+    if (path / "policy_postprocessor.json").exists():
+        post_processor = PolicyProcessorPipeline.from_pretrained(str(path), config_filename="policy_postprocessor.json")
+        if hasattr(post_processor, "to"):
+            post_processor.to(device)
+
+    if pre_processor is None and post_processor is None:
+        print(
+            f"[WARNING] no policy_preprocessor.json/policy_postprocessor.json found in {path} -- "
+            "observations/actions will NOT be normalized. If this checkpoint was trained with "
+            "MEAN_STD normalization (ours are), inference output will be wrong.",
+            flush=True,
+        )
+    return pre_processor, post_processor
+
+
 def run_policy_eval(cfg) -> None:
     import torch
     from lerobot.policies.factory import make_policy
@@ -72,6 +125,7 @@ def run_policy_eval(cfg) -> None:
     logging.info("[EVAL] make_policy")
     policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env)
     policy = policy.eval()
+    pre_processor, post_processor = load_policy_processors(cfg.policy.pretrained_path, cfg.policy.device)
 
     input_keys = list(cfg.policy.input_features)
 
@@ -96,8 +150,12 @@ def run_policy_eval(cfg) -> None:
     try:
         while True:
             observation = {k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in input_keys}
+            if pre_processor is not None:
+                observation = pre_processor(observation)
             with torch.no_grad():
                 action = policy.select_action(batch=observation)
+            if post_processor is not None:
+                action = post_processor.process_action(action)
 
             new_transition = step_env_and_process_transition(
                 env=env,
