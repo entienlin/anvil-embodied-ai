@@ -414,6 +414,46 @@ def patch_leader_skip_reset_when_stopping() -> None:
     AnvilOpenArmLeader.perform_episode_reset_and_wait = _reset_or_skip
 
 
+def patch_multi_leader_skip_reset_when_stopping() -> None:
+    """Bimanual counterpart to patch_leader_skip_reset_when_stopping()
+    above -- same real-hardware race (act_with_policy() calls
+    online_env.reset() for an about-to-be-discarded episode immediately
+    after the Nth episode's transitions are pushed, with no stop-aware
+    check of its own -- see _request_stop()'s docstring), but
+    AnvilOpenArmMultiLeader.perform_episode_reset_and_wait() lives on a
+    DIFFERENT class (teleop_anvil_openarm_multi_leader.py's composite, not
+    AnvilOpenArmLeader itself) -- the patch above only rebinds
+    AnvilOpenArmLeader's own method, so it never applies to the composite.
+    Without this, a bimanual run's auto-stop (HILSERL_MAX_EPISODES) would
+    still attempt a real homing reset for a discarded episode, reproducing
+    the exact "arms_resetter did not report homed" crash for the composite
+    leader instead of the single-arm one.
+
+    Reuses the same process-wide _auto_stop_state dict as the single-arm
+    patch -- stop_requested isn't arm-specific.
+    """
+    from .teleop_anvil_openarm_multi_leader import AnvilOpenArmMultiLeader
+
+    if getattr(AnvilOpenArmMultiLeader, "_anvil_skip_reset_patched", False):
+        return
+    AnvilOpenArmMultiLeader._anvil_skip_reset_patched = True
+
+    orig = AnvilOpenArmMultiLeader.perform_episode_reset_and_wait
+
+    def _reset_or_skip(self, timeout_s=15.0, before_homing=None, after_homed=None):
+        if _auto_stop_state.get("stop_requested"):
+            print(
+                "[AnvilOpenArmMultiLeader] stop already requested -- skipping the real "
+                "homing reset for this (about to be discarded) episode; holding every "
+                "arm as-is.",
+                flush=True,
+            )
+            return
+        return orig(self, timeout_s=timeout_s, before_homing=before_homing, after_homed=after_homed)
+
+    AnvilOpenArmMultiLeader.perform_episode_reset_and_wait = _reset_or_skip
+
+
 def patch_sac_deterministic_inference() -> None:
     """SAC session (2026-09-22): user reported policy motion is "a bit
     shaky (not smooth, but not the rapid shaky movement that leads to
@@ -1095,6 +1135,7 @@ def apply_all_patches() -> None:
     patch_robot_env_reset_to_keep_publishing()
     patch_robot_env_reset_to_home_via_arms_resetter()
     patch_leader_skip_reset_when_stopping()
+    patch_multi_leader_skip_reset_when_stopping()
     patch_train_pipeline_config_validate_for_optional_dataset()
     patch_learner_progress_visibility()
     patch_learner_stop_at_online_steps()
