@@ -22,6 +22,14 @@ Usage:
 
 HILSERL_MAX_EPISODES=N stops cleanly after N episodes (same mechanism as
 hilserl_actor/hilserl_eval_policy -- reuses patches._request_stop()).
+
+JOINT_EVAL_TRACE_OUT=/path/to/trace.npz saves a full per-tick trace (target,
+before, after -- degrees -- plus wall-clock timestamp per tick), saved even
+on crash via a finally block, mirroring run_joint_replay.py's REPLAY_TRACE_OUT.
+Added 2026-09-30 after three "commands cleanly stop mid-stream, no error"
+occurrences on real hardware that could only be reconstructed after the fact
+from aggregate log timestamps -- this gives precise, first-hand per-tick data
+for whichever occurrence happens next instead of more reconstruction.
 """
 
 import logging
@@ -39,14 +47,18 @@ def _max_episodes() -> int:
 
 
 def run_joint_policy_eval(cfg) -> None:
+    import time
+
+    import numpy as np
     import torch
     from lerobot.policies.factory import make_policy
     from lerobot.rl.gym_manipulator import create_transition, make_processors, make_robot_env
     from lerobot.types import TransitionKey
     from lerobot.utils.random_utils import set_seed
+    from lerobot.utils.robot_utils import precise_sleep
 
     from lerobot_control.hilserl import patches
-    from lerobot_control.hilserl.run_policy_eval import load_policy_processors
+    from lerobot_control.hilserl.run_policy_eval import load_policy_processors, load_sac_action_bounds
 
     logging.info("[JOINT-EVAL] make_env")
     env, teleop_device = make_robot_env(cfg=cfg.env)
@@ -63,6 +75,12 @@ def run_joint_policy_eval(cfg) -> None:
     logging.info("[JOINT-EVAL] make_policy")
     policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env).eval()
     pre_processor, post_processor = load_policy_processors(cfg.policy.pretrained_path, cfg.policy.device)
+    if cfg.policy.type == "sac":
+        # SAC checkpoints don't use PolicyProcessorPipeline -- see
+        # load_sac_action_bounds()'s docstring for why this is needed for
+        # a joint-space SAC checkpoint specifically (bc_jointspace_v1 and
+        # onward), and a no-op for the original EE-delta checkpoints.
+        load_sac_action_bounds(policy, cfg.policy.pretrained_path, cfg.policy.device)
     input_keys = list(cfg.policy.input_features)
 
     obs, info = env.reset()
@@ -80,8 +98,29 @@ def run_joint_policy_eval(cfg) -> None:
         flush=True,
     )
 
+    # gym_manipulator.py's own control_loop() paces every real step to
+    # dt=1/fps (precise_sleep(max(dt - elapsed, 0.0)) at the end of each
+    # tick) -- this loop had no such pacing at all, the same gap found and
+    # fixed in run_action_replay.py earlier tonight ("a ~13s real episode
+    # replayed in a couple of seconds"). Here it means the policy runs at
+    # whatever speed select_action()/env.step() allow (measured ~20Hz
+    # against a configured 10Hz), roughly doubling the effective commanded
+    # velocity relative to what the 10Hz training data represents, and
+    # halving the liveness watchdog's real time margin (10 ticks was tuned
+    # to be ~1s of headroom above jitter at 10Hz; at ~20Hz it's only ~0.5s).
+    dt = 1.0 / cfg.env.fps
+
+    trace_path = os.environ.get("JOINT_EVAL_TRACE_OUT")
+    trace_time, trace_target, trace_before, trace_after = [], [], [], []
+    joint_names = [f"follower_r_joint{i}" for i in range(1, 8)]
+
+    def _joint_arr(observation: dict) -> np.ndarray:
+        return np.array([observation[f"{j}.pos"] for j in joint_names], dtype=np.float64)
+
     try:
         while True:
+            step_start_time = time.perf_counter()
+            joints_before = obs
             observation = {k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in input_keys}
             if pre_processor is not None:
                 observation = pre_processor(observation)
@@ -98,6 +137,14 @@ def run_joint_policy_eval(cfg) -> None:
             obs, reward, terminated, truncated, info = env.step(raw_action)
             episode_steps += 1
             transition = env_processor(create_transition(observation=obs, info=info))
+
+            if trace_path:
+                trace_time.append(time.time())
+                trace_target.append(np.asarray(raw_action, dtype=np.float64))
+                trace_before.append(_joint_arr(joints_before))
+                trace_after.append(_joint_arr(obs))
+
+            precise_sleep(max(dt - (time.perf_counter() - step_start_time), 0.0))
 
             if terminated or truncated:
                 print(f"[JOINT-EVAL] episode {episode_idx} ended after {episode_steps} steps "
@@ -117,6 +164,16 @@ def run_joint_policy_eval(cfg) -> None:
     except KeyboardInterrupt:
         print("[JOINT-EVAL] stopping (Ctrl+C or auto-stop).", flush=True)
     finally:
+        if trace_path and trace_target:
+            np.savez(
+                trace_path,
+                time=np.array(trace_time),
+                target=np.stack(trace_target),
+                before=np.stack(trace_before),
+                after=np.stack(trace_after),
+            )
+            print(f"[JOINT-EVAL] saved {len(trace_target)}-step trace (time/target/before/after, degrees) "
+                  f"to {trace_path}", flush=True)
         if hasattr(env, "close"):
             env.close()
 

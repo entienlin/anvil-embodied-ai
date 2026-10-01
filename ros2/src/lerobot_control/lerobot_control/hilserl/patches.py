@@ -470,6 +470,15 @@ def patch_sac_deterministic_inference() -> None:
             observations_features = self.actor.encoder.get_cached_image_features(batch)
         _, _, means = self.actor(batch, observations_features)
         actions = torch.tanh(means)
+        # De-normalize back to the checkpoint's own action units when a
+        # joint-space (or any non-[-1,1]) action_bounds.json was loaded for
+        # THIS policy instance -- see load_sac_action_bounds() in
+        # run_policy_eval.py. Per-instance, not global: the original
+        # EE-delta checkpoints (already close to (-1,1) natively) have no
+        # such attribute and are returned unchanged, exactly as before.
+        mid = getattr(self, "_anvil_action_mid", None)
+        if mid is not None:
+            actions = actions * self._anvil_action_half.to(actions.device) + mid.to(actions.device)
         if self.config.num_discrete_actions is not None:
             discrete_action_value = self.discrete_critic(batch, observations_features)
             discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
@@ -477,6 +486,172 @@ def patch_sac_deterministic_inference() -> None:
         return actions
 
     SACPolicy.select_action = _select_action_deterministic
+
+
+def patch_sac_loads_action_bounds_on_from_pretrained() -> None:
+    """Real hardware incident (2026-09-30): the joint-space BC checkpoint's
+    action_bounds.json (see bc_pretrain.py's BC_ACTION_BOUNDS=auto and
+    run_policy_eval.py's load_sac_action_bounds()) was wired into
+    run_joint_policy_eval.py's eval script manually and verified there --
+    but hilserl_actor never goes through that script. It calls straight
+    into lerobot's own act_with_policy(), which constructs the policy via
+    stock make_policy()/SACPolicy.from_pretrained() with no knowledge of
+    our custom loader. Result: patch_sac_deterministic_inference()'s
+    de-normalization branch (`if mid is not None`) never fired for the
+    actor's own policy instance, sending every joint to raw tanh(means) in
+    (-1,1) -- i.e. every joint to ~0+-1 degree, the same "went to a dead
+    position" failure ACT had before its own normalization fix. Confirmed
+    live: the arm went to that position and had to be Ctrl+C'd.
+
+    Real fix, not per-entrypoint wiring: patch SACPolicy.from_pretrained
+    itself so ANY code path that loads a SAC checkpoint with an
+    action_bounds.json next to it gets the bounds attached automatically,
+    with no caller needing to remember to call load_sac_action_bounds() at
+    all. Fully backward compatible: checkpoints without that file (every
+    original ee_delta checkpoint) hit load_sac_action_bounds()'s existing
+    "file doesn't exist -> return False" guard and are unaffected.
+    """
+    from lerobot.policies.sac.modeling_sac import SACPolicy
+
+    if getattr(SACPolicy, "_anvil_action_bounds_autoload_patched", False):
+        return
+    SACPolicy._anvil_action_bounds_autoload_patched = True
+
+    orig_from_pretrained = SACPolicy.from_pretrained.__func__
+
+    @classmethod
+    def _from_pretrained(cls, pretrained_name_or_path, **kwargs):
+        policy = orig_from_pretrained(cls, pretrained_name_or_path, **kwargs)
+        from lerobot_control.hilserl.run_policy_eval import load_sac_action_bounds
+
+        device = next(policy.parameters()).device
+        load_sac_action_bounds(policy, pretrained_name_or_path, device)
+        return policy
+
+    SACPolicy.from_pretrained = _from_pretrained
+
+
+def patch_sac_normalizes_replay_buffer_actions_for_critic_loss() -> None:
+    """Real hardware incident (2026-09-30): a live joint-space actor/learner
+    session ran for several episodes -- BC's starting behavior looked
+    acceptable, then got steadily worse episode over episode until the arm
+    went into "weird motion" and died (liveness watchdog). This is a
+    DIFFERENT bug from the two already-fixed action_bounds.json gaps
+    (select_action() not de-normalizing, and from_pretrained() not
+    auto-loading bounds) -- those were both about DEPLOYMENT (what gets
+    published to the real robot). This one is about TRAINING: the online
+    RL loop was never touched by the action_bounds.json work at all.
+
+    Confirmed by reading modeling_sac.py directly: `SACPolicy.forward()`
+    does `actions: Tensor = batch[ACTION]` -- the RAW action straight from
+    the replay buffer (offline dataset column or an online transition),
+    unnormalized. For joint-space that's real degrees (e.g. -45 to +90).
+    compute_loss_critic() feeds this into critic_forward() as `actions`
+    for `q_preds` (the recorded transition's Q-estimate) -- but the SAME
+    critic_forward() call for `q_targets` (the TD-bootstrap target) uses
+    `next_action_preds`, which comes from `self.actor(...)`, i.e. a fresh
+    sample from the tanh-squashed distribution -- ALWAYS bounded to
+    (-1,1) by construction, regardless of action space. So the critic is
+    trained on the SAME logical quantity (the action) represented at two
+    wildly different scales depending on which code path produced it --
+    real degrees (magnitude up to ~90) from the buffer, versus (-1,1) from
+    the actor's own sampling. This is a genuine, severe TD-learning
+    corruption: every critic update has to reconcile an internally
+    inconsistent action representation, producing increasingly unstable Q-
+    estimates, which then directly drives compute_loss_actor()'s gradient
+    (it maximizes whatever the critic predicts) -- exactly matching
+    "started acceptable, got worse every episode."
+
+    compute_loss_actor()/compute_loss_temperature() have NO such bug --
+    confirmed by reading both directly: neither one takes a raw `actions`
+    parameter at all, they only ever use observations plus the actor's own
+    freshly-sampled (self-consistent, always tanh-bounded) action.
+
+    Fix: patch SACPolicy.forward() (the single entry point where
+    `batch[ACTION]` is extracted, feeding both compute_loss_critic() and
+    compute_loss_discrete_critic()) to normalize the batch's action into
+    the same (-1,1) space the actor's own samples live in, using the exact
+    same per-instance _anvil_action_mid/_anvil_action_half bounds already
+    attached by patch_sac_loads_action_bounds_on_from_pretrained() --
+    reusing the identical bounds already proven correct for inference,
+    just applied in the other direction (normalize in, not de-normalize
+    out). No-op (unchanged) for the original ee_delta checkpoints, which
+    have no action_bounds.json and therefore no _anvil_action_mid.
+    """
+    from lerobot.policies.sac.modeling_sac import ACTION, SACPolicy
+
+    if getattr(SACPolicy, "_anvil_critic_action_normalize_patched", False):
+        return
+    SACPolicy._anvil_critic_action_normalize_patched = True
+
+    orig_forward = SACPolicy.forward
+
+    def _forward(self, batch, model="critic"):
+        mid = getattr(self, "_anvil_action_mid", None)
+        if mid is not None and ACTION in batch:
+            batch = dict(batch)
+            half = self._anvil_action_half.to(batch[ACTION].device)
+            batch[ACTION] = (batch[ACTION] - mid.to(batch[ACTION].device)) / half
+        return orig_forward(self, batch, model=model)
+
+    SACPolicy.forward = _forward
+
+
+def patch_sac_checkpoints_carry_action_bounds() -> None:
+    """Real gap found during a joint-space-consistency audit (2026-10-01,
+    after a live RL session's checkpoint saved at step 250): the learner's
+    periodic checkpoint saving (lerobot.utils.train_utils.save_checkpoint(),
+    called from learner.py's save_training_checkpoint()) does
+    `policy.save_pretrained(pretrained_dir)` and nothing else -- it has no
+    knowledge of action_bounds.json, our own sidecar file (not a stock
+    lerobot concept). _anvil_action_mid/_anvil_action_half are plain Python
+    attributes on the policy instance, not part of its state_dict/config,
+    so they're silently absent from every RL-saved checkpoint.
+
+    Consequence if left unfixed: pointing a FUTURE run's pretrained_path at
+    one of these RL checkpoints (e.g. to resume training, or to eval it)
+    would hit patch_sac_loads_action_bounds_on_from_pretrained()'s "file
+    doesn't exist" branch, silently return with no bounds loaded, and
+    reintroduce the exact "every joint goes to ~0 degrees" bug this whole
+    action_bounds.json mechanism exists to prevent -- this time with ZERO
+    warning, since nothing crashes or logs an error, it just quietly
+    deploys an un-de-normalized policy.
+
+    Fix: patch save_checkpoint (both the module it's defined in and
+    learner.py's own already-bound import, same two-site lesson as
+    patch_step_env_squeezes_batched_action) to also write
+    action_bounds.json into the new pretrained_dir whenever the policy
+    being saved has _anvil_action_mid set. No-op for ee_delta checkpoints
+    (no such attribute).
+    """
+    from lerobot.utils import train_utils
+
+    if getattr(train_utils, "_anvil_checkpoint_bounds_patched", False):
+        return
+    train_utils._anvil_checkpoint_bounds_patched = True
+
+    orig_save_checkpoint = train_utils.save_checkpoint
+
+    def _save_checkpoint(checkpoint_dir, step, cfg, policy, optimizer, scheduler=None, **kwargs):
+        orig_save_checkpoint(checkpoint_dir, step, cfg, policy, optimizer, scheduler=scheduler, **kwargs)
+        mid = getattr(policy, "_anvil_action_mid", None)
+        half = getattr(policy, "_anvil_action_half", None)
+        if mid is None or half is None:
+            return
+        import json as _json
+        from pathlib import Path as _Path
+
+        from lerobot.utils.constants import PRETRAINED_MODEL_DIR
+
+        pretrained_dir = _Path(checkpoint_dir) / PRETRAINED_MODEL_DIR
+        with open(pretrained_dir / "action_bounds.json", "w") as f:
+            _json.dump({"mid": mid.tolist(), "half": half.tolist()}, f)
+        print(f"[SAC] carried action_bounds.json forward into {pretrained_dir}", flush=True)
+
+    train_utils.save_checkpoint = _save_checkpoint
+    import lerobot.rl.learner as learner_mod
+
+    learner_mod.save_checkpoint = _save_checkpoint
 
 
 def patch_sac_freeze_temperature() -> None:
@@ -782,6 +957,122 @@ def patch_robot_env_step_keeps_intervention_flag() -> None:
     RobotEnv.step = _step
 
 
+def patch_step_env_squeezes_batched_action() -> None:
+    """Real fake-hardware finding, joint-space actor/learner smoke test
+    (2026-09-30): `step_env_and_process_transition()`
+    (lerobot.rl.gym_manipulator, used unchanged by actor.py) hands
+    `processed_action` straight to `env.step()`, which does
+    `{f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}`
+    -- this assumes a flat, unbatched action. For the original ee_delta
+    config, that's true by the time the action reaches here: the EE-delta/
+    IK chain's last step (RobotActionToPolicyActionProcessorStep) happens
+    to squeeze its own output. For a joint-space config
+    (inverse_kinematics: null, see train_rl_push_bottle_jointspace.yaml),
+    action_processor skips that whole chain by design -- the policy's raw
+    select_action() output (SAC always returns a batched (1, N) tensor)
+    reaches env.step() unmodified, crashing with
+    `IndexError: index 1 is out of bounds for dimension 0 with size 1`.
+    This is the exact squeeze already applied manually in
+    run_joint_policy_eval.py's loop (`action.squeeze(0) if action.dim() > 1
+    else action`) -- applying it here via patch covers the actor/learner
+    path too, which reuses lerobot's own step_env_and_process_transition()
+    rather than a loop we control directly.
+
+    Safe for the ee_delta path too: squeezing an action that's already
+    flat (dim() == 1) is a no-op, so this patch changes nothing for any
+    config that isn't joint-space.
+
+    Also moves the action to CPU before handing it to env.step(): same
+    root cause as the squeeze above -- AnvilOpenArmFollower.send_action()
+    needs plain Python floats (it does np.array([action[f"{j}.pos"] ...]),
+    matching run_joint_policy_eval.py's own manual loop, which already does
+    action.detach().cpu() for this exact reason), but the ee_delta IK
+    chain's own final steps happen to already return a CPU tensor, so this
+    was never needed on that path before. Confirmed on real fake-hardware:
+    `TypeError: can't convert cuda:0 device type tensor to numpy`.
+
+    ACTOR_TRACE_OUT=/path/to/trace.jsonl (2026-09-30, after the actor path's
+    own liveness-watchdog trip at step 54 -- same still-unresolved "commands
+    sent, arm didn't respond" pattern seen repeatedly on the ACT eval path,
+    now confirmed on this path too): appends one JSON line per tick
+    (wall-clock time, target/before/after joint degrees) so the NEXT
+    occurrence gives precise per-tick data directly, mirroring
+    run_joint_policy_eval.py's JOINT_EVAL_TRACE_OUT -- that trace file is
+    what originally proved "the model kept computing correctly while our
+    own observation froze" for the ACT case. Appends incrementally (flushed
+    every write), not just at process exit, so a crash mid-run still
+    preserves every tick up to the one that failed. Wrapped in its own
+    try/except so a tracing bug can never break the real control loop.
+    """
+    from lerobot.rl import gym_manipulator
+    from lerobot.types import TransitionKey
+    from lerobot.rl.gym_manipulator import create_transition
+
+    if getattr(gym_manipulator, "_anvil_squeeze_action_patched", False):
+        return
+    gym_manipulator._anvil_squeeze_action_patched = True
+
+    import os as _os
+
+    _trace_path = _os.environ.get("ACTOR_TRACE_OUT")
+    _trace_state = {"file": None}
+
+    def _trace_tick(before: dict, target, after: dict) -> None:
+        if not _trace_path:
+            return
+        try:
+            import json as _json
+            import time as _time
+
+            if _trace_state["file"] is None:
+                _trace_state["file"] = open(_trace_path, "a")
+            joint_names = [f"follower_r_joint{i}" for i in range(1, 8)]
+            row = {
+                "time": _time.time(),
+                "target": [float(target[i]) for i in range(min(len(target), 7))],
+                "before": [float(before.get(f"{j}.pos", float("nan"))) for j in joint_names],
+                "after": [float(after.get(f"{j}.pos", float("nan"))) for j in joint_names],
+            }
+            _trace_state["file"].write(_json.dumps(row) + "\n")
+            _trace_state["file"].flush()
+        except Exception:  # noqa: BLE001 -- tracing must never break the control loop
+            pass
+
+    def _step_env_and_process_transition(env, transition, action, env_processor, action_processor):
+        transition[TransitionKey.ACTION] = action
+        transition[TransitionKey.OBSERVATION] = (
+            env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
+        )
+        before_obs = transition[TransitionKey.OBSERVATION]
+        processed_action_transition = action_processor(transition)
+        processed_action = processed_action_transition[TransitionKey.ACTION]
+        if hasattr(processed_action, "device") and processed_action.device.type != "cpu":
+            processed_action = processed_action.detach().cpu()
+        if hasattr(processed_action, "dim") and processed_action.dim() > 1:
+            processed_action = processed_action.squeeze(0)
+
+        obs, reward, terminated, truncated, info = env.step(processed_action)
+        _trace_tick(before_obs, processed_action, obs)
+
+        reward = reward + processed_action_transition[TransitionKey.REWARD]
+        terminated = terminated or processed_action_transition[TransitionKey.DONE]
+        truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
+        complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
+        new_info = processed_action_transition[TransitionKey.INFO].copy()
+        new_info.update(info)
+
+        new_transition = create_transition(
+            observation=obs, action=processed_action, reward=reward, done=terminated,
+            truncated=truncated, info=new_info, complementary_data=complementary_data,
+        )
+        return env_processor(new_transition)
+
+    gym_manipulator.step_env_and_process_transition = _step_env_and_process_transition
+    import lerobot.rl.actor as actor_mod
+
+    actor_mod.step_env_and_process_transition = _step_env_and_process_transition
+
+
 def apply_all_patches() -> None:
     """Single entry point for every runtime patch in this file. All of
     lerobot.rl.gym_manipulator's make_robot_env()/make_processors() pipeline
@@ -808,11 +1099,15 @@ def apply_all_patches() -> None:
     patch_learner_progress_visibility()
     patch_learner_stop_at_online_steps()
     patch_sac_deterministic_inference()
+    patch_sac_loads_action_bounds_on_from_pretrained()
+    patch_sac_normalizes_replay_buffer_actions_for_critic_loss()
+    patch_sac_checkpoints_carry_action_bounds()
     patch_sac_freeze_temperature()
     patch_sac_actor_warmup()
     patch_learner_episode_stats_logging()
     patch_robot_env_step_keeps_intervention_flag()
     patch_intervention_flag_in_complementary_info()
+    patch_step_env_squeezes_batched_action()
 
 
 def patch_learner_stop_at_online_steps() -> None:

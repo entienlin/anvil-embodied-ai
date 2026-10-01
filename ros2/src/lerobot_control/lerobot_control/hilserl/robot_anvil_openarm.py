@@ -17,7 +17,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import rclpy
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage, JointState
 from std_msgs.msg import Float64MultiArray
@@ -212,9 +213,35 @@ class AnvilOpenArmFollower(Robot):
 
         self._node = Node(f"anvil_hilserl_follower_{self.config.ros_prefix}")
 
-        self._node.create_subscription(JointState, self.config.joint_state_topic, self._on_joint_state, 10)
+        # Separate callback groups + a multi-threaded executor (below) so a
+        # slow/backlogged image decode can never block joint_state
+        # processing. Real-hardware finding (2026-09-30): a SingleThreadedExecutor
+        # serializes ALL callbacks on this Node through one spin_once() loop --
+        # publishing (send_action()'s self._pub.publish()) doesn't depend on
+        # the executor at all (it's a direct call from the main thread), but
+        # RECEIVING does. The wrist camera publishes full-resolution
+        # (1080x1920) frames; compressed_imgmsg_to_numpy()'s JPEG decode runs
+        # synchronously inside the same spin thread as the joint_state
+        # callback -- a slow/backlogged decode can starve joint_state
+        # processing for long enough to trip the liveness watchdog, while
+        # publish (and therefore commanded motion) keeps working the whole
+        # time. This exact asymmetry (publish fine, our own subscription
+        # frozen, arm itself and /joint_states confirmed healthy on the
+        # publisher side) is what a live occurrence showed via per-tick
+        # trace data. Separate callback groups let rclpy schedule joint_state
+        # and image callbacks on different threads instead of serializing them.
+        joint_state_cbg = MutuallyExclusiveCallbackGroup()
+        image_cbg = MutuallyExclusiveCallbackGroup()
+
+        self._node.create_subscription(
+            JointState, self.config.joint_state_topic, self._on_joint_state, 10,
+            callback_group=joint_state_cbg,
+        )
         for cam_name, topic in self.config.camera_topics.items():
-            self._node.create_subscription(CompressedImage, topic, self._make_image_cb(cam_name), 10)
+            self._node.create_subscription(
+                CompressedImage, topic, self._make_image_cb(cam_name), 10,
+                callback_group=image_cbg,
+            )
         self._pub = self._node.create_publisher(Float64MultiArray, self.config.command_topic, 10)
 
         # A dedicated executor, not the bare rclpy.spin_once(self._node)
@@ -230,7 +257,9 @@ class AnvilOpenArmFollower(Robot):
         # only had the follower, Stage 4 bypasses the leader's connect()
         # entirely). A private per-node executor avoids this regardless of
         # how many other Robot/Teleoperator instances exist in the process.
-        self._executor = SingleThreadedExecutor()
+        # MultiThreadedExecutor (not Single-) so the separate callback groups
+        # above can actually run concurrently -- see their comment.
+        self._executor = MultiThreadedExecutor(num_threads=3)
         self._executor.add_node(self._node)
 
         self._spin_stop.clear()

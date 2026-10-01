@@ -1,0 +1,104 @@
+# =============================================================================
+# Fake-hardware dataset/gRPC plumbing diagnostic: joint-space HIL-SERL
+# =============================================================================
+# Mirrors _stage6c_dataset_diag_config.yaml's exact pattern (stock keyboard_ee
+# substituted for AnvilOpenArmLeader -- the real leader needs
+# controller_manager/switch_controller + /arms_resetter/reset, neither of
+# which exist on the fake-hardware mock, same limitation Stage 3 already
+# established), but based on train_rl_push_bottle_jointspace.yaml's NEW
+# joint-space blocks: 7-dim joint_action, inverse_kinematics: null,
+# demos_v2_jointspace, bc_jointspace_v1 pretrained_path. Live intervention
+# itself is NOT exercised here (already verified offline via
+# check_jointspace_action_processor.py) -- this run's only job is to prove
+# make_dataset()/the actor<->learner gRPC loop/policy construction all work
+# for THIS specific 7-dim config, which has never been run end-to-end before.
+#
+# online_steps: 300 (short, plumbing-focused) not 4000 -- same reasoning as
+# _stage6c's own diagnostic run.
+
+env:
+  type: gym_manipulator
+  name: real_robot
+  fps: 10
+
+  features:
+    state:
+      type: STATE
+      shape: [7]
+    wrist_r_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    joint_action:
+      type: ACTION
+      shape: [7]
+  features_map:
+    state: observation.state
+    wrist_r_image: observation.images.wrist_r
+    joint_action: action
+
+  robot:
+    type: anvil_openarm_follower
+    ros_prefix: follower_r
+    joint_state_topic: /joint_states
+    command_topic: /follower_r_forward_position_controller/commands
+    num_joints: 7
+    camera_topics:
+      wrist_r: /cam_wrist_r/image_raw/compressed
+    control_frequency: 10.0
+    max_position_delta: 0.30
+    obs_timeout_s: 2.0
+
+  teleop:
+    type: keyboard_ee
+    use_gripper: false
+
+  processor:
+    control_mode: leader
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false
+      display_cameras: false
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+    gripper:
+      use_gripper: false
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 10.0
+      control_time_s: 20.0
+      terminate_on_success: true
+    inverse_kinematics: null
+    reward_classifier: null
+
+dataset:
+  repo_id: SSTC-AITeam/hilserl-push-bottle-jointspace
+  root: /tmp/demos_v2_jointspace
+  video_backend: pyav
+
+policy:
+  type: sac
+  vision_encoder_name: /workspace/configs/hilserl/resnet10
+  pretrained_path: /workspace/configs/hilserl/bc_jointspace_poc
+  device: cuda
+  push_to_hub: false
+  use_torch_compile: false
+  policy_kwargs:
+    std_max: 0.5
+  online_steps: 300
+  online_step_before_learning: 10
+  temperature_init: 0.01
+  online_buffer_capacity: 2000
+  offline_buffer_capacity: 4000
+  actor_learner_config:
+    learner_host: 127.0.0.1
+    learner_port: 50051
+
+output_dir: outputs/hilserl_push_bottle_jointspace_fakehw_diag
+job_name: hilserl_push_bottle_jointspace_fakehw_diag
+seed: 42
+batch_size: 256
+save_freq: 999999999
+wandb:
+  enable: false

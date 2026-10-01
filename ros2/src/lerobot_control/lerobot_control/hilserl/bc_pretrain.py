@@ -43,6 +43,24 @@ Env vars: BC_TRAJ_DIRS, BC_TRAJ_WEIGHT, BC_STEPS, BC_OUT, BC_BATCH (64), BC_SKIP
 BC_IDLE_THRESH (0.02), BC_SMOOTH (1 = off; k = centered moving average of the
 training targets over k ticks), BC_HOLDOUT_EVERY (8; 0 = no hold-out),
 BC_EVAL_EVERY (250).
+
+BC_ACTION_BOUNDS (2026-09-30, default "none" -- exactly reproduces every
+prior BC run's behavior unchanged): SACPolicy's actor always squashes its
+output through tanh, i.e. its native action range is (-1, 1) by
+construction (see policy_kwargs.std_max's comment in the yaml). The
+original 3-dim EE-delta action convention is a normalized per-axis
+multiplier already close to that range, so the original clamp(-0.99, 0.99)
+"normalization" worked by coincidence. It does NOT work for a joint-space
+action in real degrees (e.g. joint4 spans ~65 degrees in demos_v2_jointspace)
+-- clamping would crush every target to +-0.99, destroying the signal.
+BC_ACTION_BOUNDS=auto computes real per-joint (min, max) from the assembled
+training set itself (same "measure real bounds from data" approach already
+used for end_effector_bounds elsewhere in this project), pads it by 10% on
+each side so real deployment values slightly outside the training range
+don't hard-saturate tanh, and normalizes to/from that range in _bc_loss /
+_policy_action instead of the old fixed clamp. Set it whenever training on
+a joint-space-relabeled dataset (e.g. demos_v2_jointspace); leave unset
+("none") for the original EE-delta convention.
 """
 
 import logging
@@ -62,20 +80,28 @@ STD_PENALTY_WEIGHT = 0.1
 _KEYS = ("observation.state", "observation.images.wrist_r")
 
 
-def _policy_action(policy, batch: dict) -> torch.Tensor:
-    """The deterministic action the real robot runs (tanh of the mean)."""
+def _policy_action(policy, batch: dict, action_mid=None, action_half=None) -> torch.Tensor:
+    """The deterministic action the real robot runs (tanh of the mean),
+    de-normalized back to the dataset's own action units when
+    action_mid/action_half are given (see BC_ACTION_BOUNDS)."""
     actor = policy.actor
     hidden = actor.network(actor.encoder(batch, cache=None, detach=False))
-    return torch.tanh(actor.mean_layer(hidden))
+    out = torch.tanh(actor.mean_layer(hidden))
+    if action_mid is not None:
+        out = out * action_half.to(out.device) + action_mid.to(out.device)
+    return out
 
 
-def _bc_loss(policy, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _bc_loss(policy, batch: dict, action_mid=None, action_half=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     actor = policy.actor
     obs_enc = actor.encoder(batch, cache=None, detach=False)
     hidden = actor.network(obs_enc)
     mean = actor.mean_layer(hidden)
     std = torch.exp(actor.std_layer(hidden))  # unclamped so the penalty always has gradient
-    target = batch["action"].clamp(-0.99, 0.99)
+    if action_mid is not None:
+        target = ((batch["action"] - action_mid.to(batch["action"].device)) / action_half.to(batch["action"].device)).clamp(-1.0, 1.0)
+    else:
+        target = batch["action"].clamp(-0.99, 0.99)
     mse = F.mse_loss(torch.tanh(mean), target)
     return mse + STD_PENALTY_WEIGHT * std.mean(), mse, std.mean()
 
@@ -103,12 +129,23 @@ class _Frames(torch.utils.data.Dataset):
 def _episodes(ds, success_only: bool, trim_idle: bool, idle_thresh: float, smooth: int):
     """-> list of (frame_indices, training_targets, raw_actions), one per kept episode."""
     ep = np.array([int(x) for x in ds.hf_dataset["episode_index"]])
-    rew = np.array([float(np.array(x).reshape(-1)[0]) for x in ds.hf_dataset["next.reward"]])
+    # Datasets relabeled purely for action-space conversion (e.g.
+    # relabel_joint_space.py's demos_v2_jointspace) don't carry a
+    # next.reward column -- they were never given one, since their source
+    # (demos_v2) is already curated to be all-successful episodes by
+    # construction, with no reward-based filtering ever needed. Skip the
+    # success filter gracefully in that case rather than crash on a
+    # missing column.
+    rew = (
+        np.array([float(np.array(x).reshape(-1)[0]) for x in ds.hf_dataset["next.reward"]])
+        if "next.reward" in ds.hf_dataset.column_names
+        else None
+    )
     act = np.stack([np.array(x) for x in ds.hf_dataset["action"]]).astype(np.float32)
     kept = []
     for e in sorted(set(ep)):
         idx = np.where(ep == e)[0]
-        if success_only and rew[idx].max() <= 0:
+        if success_only and rew is not None and rew[idx].max() <= 0:
             continue
         a = act[idx]
         if trim_idle:
@@ -182,17 +219,22 @@ def _human_segments(traj_dirs: list[str], smooth: int):
 
 
 @torch.no_grad()
-def _evaluate(policy, loader, device) -> tuple[np.ndarray, float]:
+def _evaluate(policy, loader, device, action_mid=None, action_half=None) -> tuple[np.ndarray, float]:
     policy.eval()
     pa, ra = [], []
     for raw in loader:
         batch = {k: v.to(device) for k, v in raw.items() if k in _KEYS}
-        pa.append(_policy_action(policy, batch).cpu().numpy())
+        pa.append(_policy_action(policy, batch, action_mid, action_half).cpu().numpy())
         ra.append(raw["action_raw"].numpy())
     policy.train()
     pa, ra = np.concatenate(pa), np.concatenate(ra)
-    corr = np.array([np.corrcoef(pa[:, k], ra[:, k])[0, 1] if pa[:, k].std() > 1e-9 else 0.0 for k in range(3)])
-    mse = float(((pa - np.clip(ra, -0.99, 0.99)) ** 2).mean())
+    n_dims = pa.shape[1]
+    corr = np.array([np.corrcoef(pa[:, k], ra[:, k])[0, 1] if pa[:, k].std() > 1e-9 else 0.0 for k in range(n_dims)])
+    # pa is already de-normalized back to the dataset's own action units when
+    # action_mid/action_half were passed to _policy_action, so ra needs no
+    # clipping in that case -- both sides are in the same real units already.
+    ra_cmp = ra if action_mid is not None else np.clip(ra, -0.99, 0.99)
+    mse = float(((pa - ra_cmp) ** 2).mean())
     return corr, mse
 
 
@@ -210,6 +252,7 @@ def bc_pretrain(cfg) -> None:
     smooth = int(env("BC_SMOOTH", "1"))
     holdout_every = int(env("BC_HOLDOUT_EVERY", "8"))
     eval_every = int(env("BC_EVAL_EVERY", "250"))
+    action_bounds_mode = env("BC_ACTION_BOUNDS", "none")
     if os.path.exists(out_dir):
         raise FileExistsError(f"{out_dir} already exists; pick a new BC_OUT")
 
@@ -227,12 +270,13 @@ def bc_pretrain(cfg) -> None:
         print(f"[BC] extra dataset {root}: {extra.num_episodes} episodes, {len(extra)} frames", flush=True)
         sources.append(extra)
 
-    train_parts, hold_parts, n_kept, n_total = [], [], 0, 0
+    train_parts, hold_parts, all_raw, n_kept, n_total = [], [], [], 0, 0
     for ds in sources:
         n_total += ds.num_episodes
         for idx, tgt, raw in _episodes(ds, success_only, trim_idle, idle_thresh, smooth):
             is_holdout = holdout_every > 0 and n_kept % holdout_every == holdout_every - 1
             (hold_parts if is_holdout else train_parts).append(_Frames(ds, idx, tgt, raw))
+            all_raw.append(raw)
             n_kept += 1
     traj_dirs = [d for d in env("BC_TRAJ_DIRS", "").split(",") if d]
     if traj_dirs:
@@ -253,6 +297,21 @@ def bc_pretrain(cfg) -> None:
         f"train {len(train_parts)} eps / {len(train_ds)} frames, held-out {len(hold_parts)} eps",
         flush=True,
     )
+
+    action_mid = action_half = None
+    if action_bounds_mode == "auto":
+        raw_all = np.concatenate(all_raw)
+        lo, hi = raw_all.min(0), raw_all.max(0)
+        pad = 0.10 * (hi - lo)
+        lo, hi = lo - pad, hi + pad
+        action_mid = torch.as_tensor((hi + lo) / 2.0, dtype=torch.float32)
+        action_half = torch.as_tensor((hi - lo) / 2.0, dtype=torch.float32)
+        print(
+            f"[BC] BC_ACTION_BOUNDS=auto -- normalizing {len(action_mid)}-dim action to (-1,1) via per-dim "
+            f"bounds measured from {len(raw_all)} training frames (10% padded): "
+            f"lo={np.round(lo, 2).tolist()} hi={np.round(hi, 2).tolist()}",
+            flush=True,
+        )
     loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=4)
     hold_loader = (
         torch.utils.data.DataLoader(torch.utils.data.ConcatDataset(hold_parts), batch_size=128, num_workers=2)
@@ -271,7 +330,7 @@ def bc_pretrain(cfg) -> None:
     while step < steps:
         for raw in loader:
             batch = {k: v.to(device) for k, v in raw.items() if k in _KEYS + ("action",)}
-            loss, mse, std = _bc_loss(policy, batch)
+            loss, mse, std = _bc_loss(policy, batch, action_mid, action_half)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -279,15 +338,15 @@ def bc_pretrain(cfg) -> None:
             if step % 50 == 0 or step == 1:
                 print(f"[BC] step {step}/{steps} loss {loss.item():.4f} mse {mse.item():.4f} mean_std {std.item():.4f}", flush=True)
             if step % eval_every == 0 or step == steps:
-                tc, _ = _evaluate(policy, train_probe, device)
+                tc, _ = _evaluate(policy, train_probe, device, action_mid, action_half)
                 if hold_loader is not None:
-                    hc, hm = _evaluate(policy, hold_loader, device)
+                    hc, hm = _evaluate(policy, hold_loader, device, action_mid, action_half)
                     score = float(hc.mean())
                     tag = ""
                     if score > best_score:
                         best_score, tag = score, "  <- best so far"
                         best_state = {k: v.detach().clone() for k, v in policy.state_dict().items()}
-                    print(f"[BC-EVAL] step {step}: HELD-OUT corr x/y/z = {np.round(hc, 3)} (mean {score:+.3f}) mse {hm:.4f} | train corr = {np.round(tc, 3)}{tag}", flush=True)
+                    print(f"[BC-EVAL] step {step}: HELD-OUT corr per-dim = {np.round(hc, 3)} (mean {score:+.3f}) mse {hm:.4f} | train corr = {np.round(tc, 3)}{tag}", flush=True)
                 else:
                     print(f"[BC-EVAL] step {step}: train corr = {np.round(tc, 3)} (no held-out set)", flush=True)
             if step >= steps:
@@ -297,6 +356,23 @@ def bc_pretrain(cfg) -> None:
         policy.load_state_dict(best_state)
         print(f"[BC] restored best held-out checkpoint (mean corr {best_score:+.3f})", flush=True)
     policy.save_pretrained(out_dir)
+    if action_mid is not None:
+        # patch_sac_deterministic_inference() (patches.py) is the ONLY real
+        # inference call site (real-robot stepping) -- it returns raw
+        # tanh(means) in (-1,1) with no de-normalization, since it's a
+        # single global patch shared by every SACPolicy checkpoint, most of
+        # which (the original EE-delta convention) need no de-normalization
+        # at all. Save the bounds alongside the checkpoint so a loader at
+        # eval time (see run_policy_eval.py's load_sac_action_bounds()) can
+        # attach them to THIS policy instance specifically -- without this
+        # file, deploying this checkpoint would send every joint to ~0+-1
+        # degree, the same missing-normalization bug already found and
+        # fixed for ACT earlier tonight.
+        import json
+
+        with open(os.path.join(out_dir, "action_bounds.json"), "w") as f:
+            json.dump({"mid": action_mid.tolist(), "half": action_half.tolist()}, f)
+        print(f"[BC] saved action_bounds.json ({len(action_mid)}-dim) alongside the checkpoint", flush=True)
     print(f"[BC] saved pretrained policy to {out_dir}", flush=True)
 
 

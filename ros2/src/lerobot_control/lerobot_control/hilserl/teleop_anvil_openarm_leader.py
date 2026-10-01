@@ -65,6 +65,16 @@ class AnvilOpenArmLeaderConfig(TeleoperatorConfig):
     # back into the same physical step size EEReferenceAndDelta applies.
     step_sizes: dict = field(default_factory=lambda: {"x": 0.02, "y": 0.02, "z": 0.02})
     obs_timeout_s: float = 2.0
+    # "ee_delta" (default, unchanged): the original FK-based per-axis
+    # multiplier convention -- requires cfg.processor.inverse_kinematics to
+    # be set so make_processors() adds the EE-delta/IK chain.
+    # "joint_space": get_action() returns the leader's own current joint
+    # positions directly (a plain ndarray, degrees, follower joint order) --
+    # requires cfg.processor.inverse_kinematics: null so make_processors()
+    # skips the EE-delta/IK chain entirely (it's hardcoded to a 3-dim
+    # ee.x/y/z action and would crash/misbehave on a 7-dim joint action).
+    # See get_action()'s docstring for why this needs no kinematics at all.
+    action_mode: str = "ee_delta"
     # Switch-service wiring -- see switch_service_client.py. None of these
     # need to change unless the devbox names things differently than planned.
     policy_controller: str = "follower_r_forward_position_controller"
@@ -138,6 +148,8 @@ class AnvilOpenArmLeader(Teleoperator):
         # cross-checked against (Stage 3). action_features is read in
         # exactly one place in this whole pipeline (gym_manipulator.py's
         # control_loop), so this format is safe to use unconditionally.
+        if self.config.action_mode == "joint_space":
+            return {"dtype": "float32", "shape": (self.config.num_joints,), "names": None}
         return {
             "dtype": "float32",
             "shape": (3,),
@@ -417,7 +429,7 @@ class AnvilOpenArmLeader(Teleoperator):
                 "rather than retrying forever with the follower in an unknown state."
             )
 
-    def get_action(self) -> dict:
+    def get_action(self) -> dict | np.ndarray:
         if not self._is_connected:
             raise RuntimeError("AnvilOpenArmLeader is not connected")
 
@@ -430,6 +442,39 @@ class AnvilOpenArmLeader(Teleoperator):
         elif not is_intervening and self._was_intervening:
             self._handle_switch_edge(self._switch_client.switch_to_policy, target_was_intervening=False)
 
+        if self.config.action_mode == "joint_space":
+            return self._get_action_joint_space()
+        return self._get_action_ee_delta(is_intervening)
+
+    def _get_action_joint_space(self) -> np.ndarray:
+        """joint_space mode: return the leader's own current joint positions
+        directly (degrees, follower joint order -- leader_r/follower_r are
+        the same 7-DOF arm with a direct 1:1 joint correspondence, no
+        kinematics needed). InterventionActionProcessorStep only reads this
+        when is_intervention is True (see its own source -- `if
+        is_intervention and teleop_action is not None`), so it's safe and
+        simplest to always return the leader's real live pose regardless of
+        intervention state, rather than special-case a "no-op" value the
+        way ee_delta's zero-vector convention needs.
+
+        Also a real, unplanned data-fidelity win over ee_delta: during
+        intervention the real follower is mirrored directly by the devbox's
+        native teleop_controller, bypassing this whole action_processor
+        pipeline -- this label is never what actually drives the arm, only
+        what gets recorded/trained on. ee_delta's FK-based approximation of
+        that real motion was confirmed to only correlate 0.5-0.7 with what
+        the follower actually did (2-3x magnitude mismatches, 1-2 tick lag)
+        -- the exact bug this whole joint-space investigation started from.
+        Reading the leader's own joint state directly has no such
+        approximation error: it *is* what the native mirroring is built to
+        reproduce on the follower, not a derived estimate of it.
+        """
+        if not self._has_leader_joint_data():
+            return np.zeros(self.config.num_joints, dtype=np.float32)
+        name_to_pos = dict(zip(self._latest_joint_state.name, self._latest_joint_state.position, strict=False))
+        return np.rad2deg(np.array([name_to_pos[j] for j in self.joint_names], dtype=np.float32))
+
+    def _get_action_ee_delta(self, is_intervening: bool) -> dict:
         if not is_intervening or self._leader_ee_ref is None:
             return {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0}
 

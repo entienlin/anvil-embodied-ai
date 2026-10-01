@@ -99,6 +99,41 @@ def load_policy_processors(pretrained_path, device):
     return pre_processor, post_processor
 
 
+def load_sac_action_bounds(policy, pretrained_path, device) -> bool:
+    """SAC checkpoints don't use PolicyProcessorPipeline (bc_pretrain.py
+    trains on raw, unnormalized tensors by design) -- but a joint-space
+    checkpoint's actor was trained against a (-1,1)-normalized target (see
+    bc_pretrain.py's BC_ACTION_BOUNDS=auto), while
+    patch_sac_deterministic_inference() (patches.py) is a single GLOBAL
+    patch shared by every SACPolicy checkpoint, most of which (the
+    original EE-delta convention) need no de-normalization. If
+    <pretrained_path>/action_bounds.json exists, attach its (mid, half) as
+    attributes on THIS policy instance so the global patch can de-normalize
+    only for checkpoints that actually need it. Returns True if bounds were
+    loaded (and prints so, since silently deploying an un-de-normalized
+    joint-space checkpoint sends every joint to ~0+-1 degree -- the exact
+    bug this closes).
+    """
+    import json
+    from pathlib import Path
+
+    import torch
+
+    bounds_path = Path(pretrained_path) / "action_bounds.json"
+    if not bounds_path.exists():
+        return False
+    with open(bounds_path) as f:
+        bounds = json.load(f)
+    policy._anvil_action_mid = torch.as_tensor(bounds["mid"], dtype=torch.float32, device=device)
+    policy._anvil_action_half = torch.as_tensor(bounds["half"], dtype=torch.float32, device=device)
+    print(
+        f"[SAC] loaded action_bounds.json from {pretrained_path} -- real-robot inference will be "
+        f"de-normalized back to this checkpoint's own {len(bounds['mid'])}-dim action units.",
+        flush=True,
+    )
+    return True
+
+
 def run_policy_eval(cfg) -> None:
     import torch
     from lerobot.policies.factory import make_policy

@@ -1,0 +1,188 @@
+# =============================================================================
+# HIL-SERL: joint-space variant of train_rl_push_bottle.yaml (BC pretrain first)
+# =============================================================================
+# Why this exists (2026-09-30): HIL-SERL's own BC/DAgger work (BC v1-v8,
+# three DAgger rounds, see train_rl_push_bottle.yaml's policy.pretrained_path
+# comment history) plateaued at ~intervention-rate 0.4-0.5 with no real
+# improvement across rounds. Same night, a *completely separate* ACT
+# investigation found the root cause of an unrelated "wrong motion" bug:
+# AnvilOpenArmLeader.get_action()'s EE-delta action label (an FK-based delta
+# between the leader's and follower's poses) is causally disconnected from
+# what the follower actually does during real human intervention -- the real
+# follower is driven directly by the devbox's native teleop_controller,
+# bypassing our action pipeline entirely. Only 0.5-0.7 correlated with the
+# follower's real motion, 2-3x magnitude mismatches. Every HIL-SERL BC/DAgger
+# episode ever recorded used this exact same leader-derived label -- a much
+# better explanation for the DAgger plateau than anything investigated in the
+# plan up to that point (auto-entropy tuner, batch size, critic action-
+# blindness -- all real fixes, none of them touch the label itself).
+#
+# This config points BC pretraining at demos_v2_jointspace (already relabeled
+# for the ACT retrain: action = the follower's own next-tick
+# observation.state, not the leader-derived delta) instead of demos_v2, as a
+# direct, offline, no-real-hardware-needed test of the same hypothesis that
+# already improved ACT (train loss 0.104->0.030, test loss 0.263->0.128).
+#
+# SACPolicy's actor always squashes its output through tanh (native range
+# (-1,1) by construction) -- the old ee_delta_action convention is a
+# normalized per-axis multiplier already close to that range, so the
+# original BC script's fixed clamp(-0.99, 0.99) worked by coincidence. It
+# does NOT work for a 7-dim joint-space action in real degrees (e.g. joint4
+# spans ~65 degrees in demos_v2_jointspace) -- bc_pretrain.py now supports
+# BC_ACTION_BOUNDS=auto for exactly this (see its own docstring), which MUST
+# be set when running BC against this config.
+#
+# Usage -- BC pretrain (offline, no robot/ROS2 needed at runtime):
+#   BC_ACTION_BOUNDS=auto BC_STEPS=1500 BC_OUT=outputs/bc_jointspace_v2 \
+#   ros2 run lerobot_control hilserl_bc_pretrain \
+#     --config_path configs/hilserl/train_rl_push_bottle_jointspace.yaml
+#
+# Usage -- live actor/learner (real hardware, two processes, learner first):
+#   ros2 run lerobot_control hilserl_learner --config_path configs/hilserl/train_rl_push_bottle_jointspace.yaml
+#   ros2 run lerobot_control hilserl_actor --config_path configs/hilserl/train_rl_push_bottle_jointspace.yaml --output_dir=outputs/hilserl_push_bottle_jointspace_actor
+#
+# 2026-09-30, later same night: made this config actually live-actor-ready.
+# teleop.action_mode: joint_space + processor.inverse_kinematics: null (see
+# both fields' own comments below) get action_processor to reduce to just
+# intervention/reward handling, with NO EE-delta/IK conversion and NO
+# monkey-patch -- an existing built-in escape hatch in lerobot's own
+# make_processors(), confirmed by reading its source. AnvilOpenArmLeader
+# gained a real, non-trivial code change (_get_action_joint_space()) to
+# supply a shape-compatible intervention action; everything else (env
+# stepping, gRPC, reward/success detection, the actor/learner split) is
+# lerobot's own unmodified actor.py/learner.py, exactly as the EE-delta
+# config already uses.
+
+env:
+  type: gym_manipulator
+  name: real_robot
+  fps: 10
+
+  features:
+    state:
+      type: STATE
+      shape: [7]
+    wrist_r_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    joint_action:
+      type: ACTION
+      shape: [7]
+  features_map:
+    state: observation.state
+    wrist_r_image: observation.images.wrist_r
+    joint_action: action
+
+  robot:
+    type: anvil_openarm_follower
+    ros_prefix: follower_r
+    joint_state_topic: /joint_states
+    command_topic: /follower_r_forward_position_controller/commands
+    num_joints: 7
+    camera_topics:
+      wrist_r: /cam_wrist_r/image_raw/compressed
+    control_frequency: 10.0
+    max_position_delta: 0.08
+    max_command_step_rad: 0.06
+    obs_timeout_s: 2.0
+
+  teleop:
+    type: anvil_openarm_leader
+    ros_prefix: leader_r
+    joint_state_topic: /joint_states
+    num_joints: 7
+    urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+    target_frame_name: leader_r_hand_tcp
+    step_sizes:
+      x: 0.02
+      y: 0.02
+      z: 0.02
+    obs_timeout_s: 2.0
+    policy_controller: follower_r_forward_position_controller
+    teleop_controller: teleop_controller
+    follower_command_topic: /follower_r_forward_position_controller/commands
+    follower_joint_prefix: follower_r
+    # joint_space, not the default ee_delta: get_action() returns the
+    # leader's own current joint positions directly during intervention
+    # (a plain ndarray, no kinematics needed) instead of an FK-based
+    # per-axis delta -- see teleop_anvil_openarm_leader.py's
+    # _get_action_joint_space() docstring for why this is both required
+    # (InterventionActionProcessorStep's dict branch is hardcoded to
+    # delta_x/y/z, but its ndarray branch is fully generic) and a real
+    # data-fidelity improvement over ee_delta's FK approximation.
+    action_mode: joint_space
+
+  processor:
+    control_mode: leader
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false
+      display_cameras: false
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+    gripper:
+      use_gripper: false
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 18.0
+      control_time_s: 20.0
+      terminate_on_success: true
+    # null, not an inverse_kinematics block: make_processors() (lerobot's
+    # gym_manipulator.py) only adds the EE-delta/IK chain
+    # (MapTensorToDeltaActionDictStep -> ... -> InverseKinematicsRLStep)
+    # when this is set. Leaving it null makes action_processor reduce to
+    # just AddTeleopActionAsComplimentaryDataStep -> AddTeleopEventsAsInfoStep
+    # -> InterventionActionProcessorStep -- exactly what a joint-space
+    # policy needs (the IK chain is hardcoded to a 3-dim ee.x/y/z action
+    # and would crash/misbehave on our 7-dim joint action). No monkey-patch
+    # needed -- this is an existing, built-in escape hatch in lerobot's own
+    # make_processors(), confirmed by reading its source directly.
+    inverse_kinematics: null
+    reward_classifier: null
+
+# demos_v2_jointspace: same 40 episodes/3150 frames as demos_v2, action
+# column replaced with the follower's own next-tick observation.state
+# (degrees) instead of the leader-derived EE-delta -- see relabel_joint_space.py
+# (scratchpad) for the exact transform, already used for tonight's ACT retrain.
+# root is a container-internal path -- mount the HOST directory via
+# `-v .../data/datasets/_recordings/demos_v2_jointspace:/tmp/demos_v2_jointspace:ro`.
+dataset:
+  repo_id: SSTC-AITeam/hilserl-push-bottle-jointspace
+  root: /tmp/demos_v2_jointspace
+  video_backend: pyav
+
+policy:
+  type: sac
+  vision_encoder_name: /workspace/configs/hilserl/resnet10
+  # bc_jointspace_v1 (held-out corr +0.995-0.996, see the BC pretrain log
+  # 2026-09-30) -- mount it at this exact path via
+  # `-v .../outputs/bc_jointspace_v1:/workspace/configs/hilserl/bc_jointspace_poc:ro`.
+  # For a NEW BC pretrain run instead (producing a fresh checkpoint via
+  # BC_OUT), comment this out -- bc_pretrain.py's make_policy() call uses
+  # this same policy: block, and a non-empty pretrained_path there would
+  # load and start FROM this checkpoint rather than from scratch.
+  pretrained_path: /workspace/configs/hilserl/bc_jointspace_poc
+  device: cuda
+  push_to_hub: false
+  storage_device: cuda
+  use_torch_compile: false
+  policy_kwargs:
+    std_max: 0.5
+  online_steps: 4000
+  online_step_before_learning: 10
+  temperature_init: 0.01
+  online_buffer_capacity: 2000
+  offline_buffer_capacity: 4000
+  actor_learner_config:
+    learner_host: 127.0.0.1
+    learner_port: 50051
+
+output_dir: outputs/hilserl_push_bottle_jointspace
+job_name: hilserl_push_bottle_jointspace
+seed: 42
+batch_size: 256
+save_freq: 250
+wandb:
+  enable: false
