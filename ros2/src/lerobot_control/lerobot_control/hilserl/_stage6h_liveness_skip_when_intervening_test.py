@@ -2,6 +2,17 @@
 position controller inactive => our commands legitimately ignored), but must
 still trip when the policy is driving and the arm doesn't respond.
 
+Updated 2026-10-01 (bimanual registry fix): the module-level
+`_registered_leader` singleton this test used to poke directly became a
+dict (`_registered_leaders`, keyed by ros_prefix) so a second
+AnvilOpenArmLeader (one per arm, for bimanual) can register without
+silently overwriting the first -- see teleop_anvil_openarm_leader.py's
+module docstring. This test now populates that dict instead, and goes
+through `is_any_leader_intervening()` (what robot_anvil_openarm.py's
+_check_liveness() now actually calls) rather than reaching into a single
+`leader` reference -- same two scenarios, same expected outcomes, just
+updated for the new keyed-registry API.
+
 Run: python3 -m lerobot_control.hilserl._stage6h_liveness_skip_when_intervening_test
 """
 
@@ -33,7 +44,8 @@ def main() -> int:
     cfg = AnvilOpenArmFollowerConfig(ros_prefix="follower_r", camera_topics={"wrist_r": "/x"})
     robot = AnvilOpenArmFollower(cfg)
 
-    leader_mod._registered_leader = _Leader(intervening=True)
+    leader_mod._registered_leaders.clear()
+    leader_mod._registered_leaders["leader_r"] = _Leader(intervening=True)
     try:
         _run(robot)
     except RuntimeError:
@@ -41,7 +53,8 @@ def main() -> int:
         return 1
     print("[OK] no trip while intervening", flush=True)
 
-    leader_mod._registered_leader = _Leader(intervening=False)
+    leader_mod._registered_leaders.clear()
+    leader_mod._registered_leaders["leader_r"] = _Leader(intervening=False)
     try:
         _run(robot)
     except RuntimeError:

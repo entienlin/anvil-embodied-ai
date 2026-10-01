@@ -499,10 +499,17 @@ class AnvilOpenArmFollower(Robot):
         # are ignored by design -- a still leader arm then looks exactly like
         # "commanded movement, no response". Confirmed false positive: the
         # actor died ~8s after the user pressed space (2026-09-21 07:13).
-        from lerobot_control.hilserl.teleop_anvil_openarm_leader import get_registered_leader
+        # is_any_leader_intervening() (not a single get_registered_leader()
+        # lookup): the registry became keyed by ros_prefix so a second
+        # AnvilOpenArmLeader (bimanual, one per arm) can coexist without
+        # overwriting the first's registration -- see that module's
+        # docstring for the overwrite bug this replaced. For exactly one
+        # registered leader (the single-arm case this watchdog was
+        # originally written for) this is byte-for-byte the same check as
+        # before.
+        from lerobot_control.hilserl.teleop_anvil_openarm_leader import is_any_leader_intervening
 
-        leader = get_registered_leader()
-        if leader is not None and (leader._was_intervening or leader._keyboard.is_intervention):
+        if is_any_leader_intervening():
             self._liveness_commanded_streak = 0
             self._liveness_observed_window.clear()
             return

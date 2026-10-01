@@ -50,6 +50,16 @@ class KeyboardIntervention:
         self._orig_term_settings = None
 
     def start(self) -> None:
+        # Idempotent: a second start() while a reader thread is already
+        # running is a no-op rather than spawning a second thread. Defense
+        # in depth for bimanual/multi-arm use (see
+        # teleop_anvil_openarm_multi_leader.py) -- the composite leader is
+        # responsible for calling start()/stop() exactly once on a shared
+        # instance, but a stray extra call here must not reintroduce the
+        # exact stdin-race this class's module docstring warns about (two
+        # threads both doing blocking sys.stdin.read(1) on the same fd).
+        if self._thread is not None and self._thread.is_alive():
+            return
         if not sys.stdin.isatty():
             raise RuntimeError(
                 "KeyboardIntervention needs a real interactive TTY -- run the "

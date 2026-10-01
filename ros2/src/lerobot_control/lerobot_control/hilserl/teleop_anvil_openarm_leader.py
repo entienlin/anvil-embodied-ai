@@ -45,11 +45,71 @@ from .switch_service_client import SwitchServiceClient
 # make_processors()) can reach the one AnvilOpenArmLeader instance in this
 # process to trigger the post-homing baseline handoff. Set at the end of
 # connect(), cleared at the start of disconnect() -- see both for why.
-_registered_leader: "AnvilOpenArmLeader | None" = None
+#
+# Bimanual gap (2026-10-01): this used to be a single `_registered_leader`
+# object, not a dict. The moment a second AnvilOpenArmLeader starts
+# existing in the same process (one per arm, for bimanual control), its
+# connect() call silently overwrote the first arm's registration -- the
+# second-to-connect arm's leader would be the only one _check_liveness()
+# and the reset patch could ever see, and the first arm's own watchdog
+# would lose its false-positive-during-intervention suppression entirely.
+# Keyed by ros_prefix so every arm's leader coexists safely. See
+# get_registered_leader()/is_any_leader_intervening() below for how
+# callers (both the single-arm ones already in this codebase, and the new
+# multi-arm composite in teleop_anvil_openarm_multi_leader.py) use this.
+_registered_leaders: dict[str, "AnvilOpenArmLeader"] = {}
+
+# Reserved registry key a composite (multi-arm) leader registers itself
+# under, in ADDITION to its sub-leaders each registering under their own
+# ros_prefix. See get_registered_leader()'s no-arg branch: a registered
+# composite is always preferred there, since it (not either individual
+# sub-leader) is the one object whose perform_episode_reset_and_wait()
+# correctly orchestrates a reset across every arm at once.
+MULTI_LEADER_REGISTRY_KEY = "__multi__"
 
 
-def get_registered_leader() -> "AnvilOpenArmLeader | None":
-    return _registered_leader
+def get_registered_leader(ros_prefix: str | None = None) -> "AnvilOpenArmLeader | None":
+    """Look up a registered AnvilOpenArmLeader (or composite multi-leader).
+
+    ros_prefix given: exact lookup by arm -- used by callers that know
+    which specific arm's leader they need.
+
+    ros_prefix=None (the original, single-arm calling convention used
+    unchanged by robot_anvil_openarm.py's reset bookkeeping and
+    patches.py's patch_robot_env_reset_to_home_via_arms_resetter()):
+    prefers a registered composite multi-leader if one exists (it is the
+    single object meant to represent "the leader" when there's more than
+    one arm), otherwise returns the one registered leader when exactly
+    one is registered (byte-for-byte the old singleton's behavior for
+    single-arm setups), otherwise None. This makes both existing
+    no-argument call sites work unmodified for single-arm, bimanual, and
+    any other arm count the composite leader supports.
+    """
+    if ros_prefix is not None:
+        return _registered_leaders.get(ros_prefix)
+    composite = _registered_leaders.get(MULTI_LEADER_REGISTRY_KEY)
+    if composite is not None:
+        return composite
+    if len(_registered_leaders) == 1:
+        return next(iter(_registered_leaders.values()))
+    return None
+
+
+def is_any_leader_intervening() -> bool:
+    """True if any registered leader (any arm, plus a registered composite
+    if present) currently reports active-or-just-ended intervention.
+
+    Used by each follower's liveness watchdog (_check_liveness() in
+    robot_anvil_openarm.py) to suppress the false-positive "arm looks
+    dead" trip while a human is actually driving it via the leader rig.
+    Intervention is a single shared human decision covering every arm at
+    once (one person, one leader rig, both hands at once -- see
+    teleop_anvil_openarm_multi_leader.py's module docstring), so for
+    exactly one registered leader this reduces to the original per-leader
+    check; for several, checking any of them is correct because they all
+    ultimately read the same shared KeyboardIntervention instance.
+    """
+    return any(leader._was_intervening or leader._keyboard.is_intervention for leader in _registered_leaders.values())
 
 
 @TeleoperatorConfig.register_subclass("anvil_openarm_leader")
@@ -93,9 +153,21 @@ class AnvilOpenArmLeader(Teleoperator):
     config_class = AnvilOpenArmLeaderConfig
     name = "anvil_openarm_leader"
 
-    def __init__(self, config: AnvilOpenArmLeaderConfig):
+    def __init__(self, config: AnvilOpenArmLeaderConfig, shared_keyboard: KeyboardIntervention | None = None):
+        """shared_keyboard: for bimanual/multi-arm use only (see
+        teleop_anvil_openarm_multi_leader.py). Passing an already-started
+        KeyboardIntervention instance makes this instance treat keyboard
+        lifecycle (start()/stop()) as someone else's responsibility -- two
+        AnvilOpenArmLeader instances both independently calling
+        KeyboardIntervention.start() in one process would spawn two
+        threads racing for every keystroke off the same stdin fd (see
+        keyboard_intervention.py's module docstring). Default None
+        preserves the original single-arm behavior exactly: this instance
+        creates and fully owns its own private KeyboardIntervention.
+        """
         super().__init__(config)
         self.config = config
+        self._owns_keyboard_lifecycle = shared_keyboard is None
         self.joint_names = [f"{config.ros_prefix}_joint{i}" for i in range(1, config.num_joints + 1)]
         # +1 gripper/finger joint: SwitchServiceClient's bumpless-transfer
         # pre-publish sends these joints' current positions on the same
@@ -121,7 +193,7 @@ class AnvilOpenArmLeader(Teleoperator):
         self._is_connected = False
         self._latest_joint_state: JointState | None = None
 
-        self._keyboard = KeyboardIntervention()
+        self._keyboard = shared_keyboard if shared_keyboard is not None else KeyboardIntervention()
         self._switch_client: SwitchServiceClient | None = None
         self._arms_resetter: ArmsResetterClient | None = None
         self._was_intervening = False
@@ -254,13 +326,13 @@ class AnvilOpenArmLeader(Teleoperator):
                 "actually loaded on the devbox yet (not just teleop_controller)?"
             )
 
-        self._keyboard.start()
+        if self._owns_keyboard_lifecycle:
+            self._keyboard.start()
 
         deadline = time.monotonic() + self.config.obs_timeout_s * 3
         while time.monotonic() < deadline:
             if self._has_leader_joint_data():
-                global _registered_leader
-                _registered_leader = self
+                _registered_leaders[self.config.ros_prefix] = self
                 return
             time.sleep(0.05)
         raise RuntimeError(
@@ -533,9 +605,8 @@ class AnvilOpenArmLeader(Teleoperator):
         if not self._is_connected:
             return
 
-        global _registered_leader
-        if _registered_leader is self:
-            _registered_leader = None
+        if _registered_leaders.get(self.config.ros_prefix) is self:
+            del _registered_leaders[self.config.ros_prefix]
 
         # Real hardware finding (Stage 5): pressing 's'/'f' (success/failure)
         # ends the episode and, for gym_manipulator.py's num_episodes_to_record
@@ -568,7 +639,8 @@ class AnvilOpenArmLeader(Teleoperator):
         if self._switch_client is not None and not self._reset_in_progress_unsafe:
             self._switch_client.switch_to_policy()
 
-        self._keyboard.stop()
+        if self._owns_keyboard_lifecycle:
+            self._keyboard.stop()
         self._spin_stop.set()
         if self._spin_thread is not None:
             self._spin_thread.join(timeout=2.0)
