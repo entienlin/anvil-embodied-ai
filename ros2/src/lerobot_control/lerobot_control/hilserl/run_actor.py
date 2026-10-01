@@ -31,7 +31,9 @@ def main() -> None:
     from lerobot.rl.actor import actor_cli
 
     from lerobot_control.hilserl.patches import apply_all_patches
+    from lerobot_control.hilserl.session_provenance import log_session_provenance
 
+    log_session_provenance("actor")
     apply_all_patches()
     actor_cli()
 
