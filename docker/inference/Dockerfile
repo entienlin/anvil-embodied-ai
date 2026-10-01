@@ -4,6 +4,15 @@ FROM ros:jazzy-ros-base
 ARG LEROBOT_VERSION=0.5.1
 ARG LEROBOT_EXTRAS=""
 
+# Build provenance -- pass via `--build-arg GIT_COMMIT=$(git rev-parse HEAD)
+# --build-arg GIT_DIRTY=...` (scripts/build_hilserl_image.sh does this
+# automatically). Baked into BUILD_INFO.json below so a running container
+# can answer "what code is this, actually" without trusting that whoever
+# ran `docker build` remembered to rebuild after their last code change --
+# see session_provenance.py for the runtime side of this.
+ARG GIT_COMMIT=unknown
+ARG GIT_DIRTY=unknown
+
 # Set environment
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -140,6 +149,16 @@ COPY configs /workspace/configs
 RUN . /opt/ros/jazzy/setup.sh && \
     cd /workspace && \
     colcon build --symlink-install
+
+# Record build provenance -- read by session_provenance.py at process
+# startup (run_actor.py/run_learner.py/run_gym_manipulator.py) so every
+# real-hardware run's log starts with a line saying exactly what code
+# produced it, instead of needing to be reconstructed after the fact.
+ARG GIT_COMMIT
+ARG GIT_DIRTY
+RUN echo "{\"git_commit\": \"${GIT_COMMIT}\", \"git_dirty\": \"${GIT_DIRTY}\", \"built_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+    > /workspace/BUILD_INFO.json
+LABEL git_commit="${GIT_COMMIT}" git_dirty="${GIT_DIRTY}"
 
 # Set entrypoint
 COPY docker/inference/entrypoint.sh /entrypoint.sh

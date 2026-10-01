@@ -1,8 +1,91 @@
-"""Runtime patches for lerobot 0.5.1 gaps affecting gripper-less HIL-SERL
-robots (this project's push-bottle task has none, per the plan's task
-decision).
+"""Runtime patches for lerobot 0.5.1 gaps affecting this project's
+push-bottle HIL-SERL task, applied via apply_all_patches() from all three
+entrypoints (run_actor.py, run_learner.py, run_gym_manipulator.py).
 
-Both patches target the same class of bug: a processor step unconditionally
+INDEX -- every patch currently registered in apply_all_patches(), in that
+function's own order, with the date each was first introduced (from git
+log) and the one-line symptom it exists to fix. Keep this in sync when
+adding/removing a patch -- it exists specifically so a future "did
+something change" question (ours or a real-hardware fault) can be answered
+by scanning this list instead of re-reading the whole file, or worse,
+re-deriving it live during an active debugging session.
+
+  2026-09-17  patch_map_delta_action_for_gripperless_robots
+      MapDeltaActionToRobotActionStep.action() unconditionally pop()s
+      "gripper" with no use_gripper guard -- crashes gripper-less robots.
+  2026-09-17  patch_ee_bounds_and_safety_to_clamp_not_crash
+      EEBoundsAndSafety.action() computes a clamp for an oversized EE jump
+      then raises anyway instead of using it -- crashed real give-backs.
+  2026-09-17  patch_inverse_kinematics_to_always_reseed_from_real_joints
+      InverseKinematicsRLStep reseeds its IK solver from its OWN prior
+      output, not the real robot -- drifts during human intervention, then
+      snaps to a bogus joint config on give-back ("shutdown position").
+  2026-09-17  patch_robot_env_reset_to_keep_publishing
+      RobotEnv.reset()'s blocking sleep publishes zero commands for its
+      whole duration -- a real, guaranteed gap in the command topic.
+  2026-09-18  patch_robot_env_reset_to_home_via_arms_resetter
+      Upgrades the above hold-in-place reset to a real homing move via the
+      devbox's arms_resetter_node, with a post-homing baseline controller
+      handoff (policy drives by default after every reset).
+  2026-09-29  patch_leader_skip_reset_when_stopping
+      The actor's own auto-stop can race the next episode's reset(),
+      losing ROS context mid-homing-call for an episode that'll never run.
+  2026-09-22  patch_sac_deterministic_inference
+      SACPolicy.select_action() resamples fresh stochastic noise every
+      10Hz tick -- causes persistent per-tick "creeping" jitter on real
+      hardware. Patched to return tanh(mean) (the mode) instead.
+  2026-10-01  patch_sac_loads_action_bounds_on_from_pretrained
+      Auto-loads action_bounds.json (joint-space de-normalization) on
+      EVERY SACPolicy.from_pretrained() call, not just one entrypoint --
+      missing this caused a real "arm went to dead position" incident.
+  2026-10-01  patch_sac_normalizes_replay_buffer_actions_for_critic_loss
+      compute_loss_critic() mixed raw-degree replay-buffer actions with
+      the actor's own tanh-bounded (-1,1) samples -- a TD-learning
+      scale-mismatch that corrupted the critic for joint-space actions.
+  2026-10-01  patch_sac_checkpoints_carry_action_bounds
+      Periodic RL checkpoint saves never copied action_bounds.json
+      forward -- would silently reintroduce the de-norm bug for any
+      checkpoint later used as a pretrained_path.
+  2026-09-22  patch_sac_freeze_temperature
+      SAC's auto-entropy tuner re-inflates action noise back up within
+      ~250 steps regardless of temperature_init -- zeroes its loss
+      gradient so the configured temperature actually holds.
+  2026-09-24  patch_learner_episode_stats_logging
+      Surfaces per-episode intervention-rate stats (the docs' own
+      definition of HIL-SERL progress) that lerobot already computes but
+      never prints.
+  2026-09-29  patch_sac_actor_warmup
+      First real-RL session: gradient updates measurably WORSENED the
+      policy immediately (intervention rate ~0.39-0.50 -> ~0.54) -- an
+      undertrained critic giving the actor bad early guidance. Opt-in
+      (HILSERL_ACTOR_WARMUP_STEPS) critic-only warm-up window.
+  2026-09-24  patch_robot_env_step_keeps_intervention_flag
+      RobotEnv.step() silently zeroes the per-step IS_INTERVENTION flag,
+      so logged intervention rate always read 0.0.
+  2026-10-01  patch_step_env_squeezes_batched_action
+      SAC's batched (1,N) action tensor was never squeezed/CPU-transferred
+      for the joint-space path (EE-delta's IK chain squeezed it by
+      coincidence) -- crashed env.step(). Also adds ACTOR_TRACE_OUT
+      per-tick trace logging.
+  2026-09-21  patch_learner_stop_at_online_steps
+      lerobot's learner loop never exits on reaching online_steps -- kept
+      re-training on the same finite buffer forever (seen: 4000+ steps for
+      a configured 1000-step budget).
+  2026-09-24  patch_intervention_flag_in_complementary_info
+      actor.py's complementary_info never set IS_INTERVENTION, so the
+      learner's own offline-buffer-growth-on-intervention logic was dead
+      code in practice.
+  2026-09-21  patch_learner_progress_visibility
+      Learner-side gRPC/training logging never appeared in the terminal --
+      a silent learner and a stuck one looked identical.
+  2026-09-17  patch_train_pipeline_config_validate_for_optional_dataset
+      TrainPipelineConfig.validate() crashes on dataset=None even though
+      it's declared Optional specifically to support pure-online RL.
+
+Patch #1 (patch_map_delta_action_for_gripperless_robots) detail follows,
+since its sibling (the observation-side gap) is worked around via config
+rather than a second patch here -- both patches target the same class of
+bug: a processor step unconditionally
 reads/pops a "gripper"-named key with no `use_gripper` check, even though
 the step immediately upstream of it *does* correctly gate that key's
 presence on `use_gripper`. Confirmed via direct source read, not guessed:

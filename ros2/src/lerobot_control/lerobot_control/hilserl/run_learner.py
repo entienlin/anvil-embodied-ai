@@ -32,7 +32,9 @@ def main() -> None:
     from lerobot.rl.learner import train_cli
 
     from lerobot_control.hilserl.patches import apply_all_patches
+    from lerobot_control.hilserl.session_provenance import log_session_provenance
 
+    log_session_provenance("learner")
     apply_all_patches()
     train_cli()
 

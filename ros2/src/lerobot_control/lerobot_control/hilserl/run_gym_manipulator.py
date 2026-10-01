@@ -23,7 +23,9 @@ def main() -> None:
     from lerobot.rl.gym_manipulator import main as gym_manipulator_main
 
     from lerobot_control.hilserl.patches import apply_all_patches
+    from lerobot_control.hilserl.session_provenance import log_session_provenance
 
+    log_session_provenance("gym_manipulator")
     apply_all_patches()
     gym_manipulator_main()
 
