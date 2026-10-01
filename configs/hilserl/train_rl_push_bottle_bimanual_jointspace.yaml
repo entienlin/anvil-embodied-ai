@@ -1,0 +1,202 @@
+# =============================================================================
+# HIL-SERL: bimanual (2-arm, 4-camera) variant of train_rl_push_bottle_jointspace.yaml
+# =============================================================================
+# Built on the just-validated single-arm joint-space config (see that
+# file's own header for the full history of why joint-space replaced
+# EE-delta). This is the bimanual extension: same joint-space convention,
+# same `processor.inverse_kinematics: null` escape hatch (see this
+# project's bimanual task notes -- namespacing the stock EE-delta/IK chain
+# for two independent end-effectors would be real, nontrivial new code
+# this design deliberately avoids by never engaging it at all), just
+# 2 arms (14 joints total, no gripper) and 4 cameras instead of 1+1.
+#
+# robot.type/teleop.type here are the NEW composite classes
+# (AnvilOpenArmMultiFollower/AnvilOpenArmMultiLeader,
+# ros2/src/lerobot_control/lerobot_control/hilserl/robot_anvil_openarm_multi.py
+# and teleop_anvil_openarm_multi_leader.py) -- NOT the single-arm
+# anvil_openarm_follower/anvil_openarm_leader types train_rl_push_bottle_jointspace.yaml
+# uses. The composite classes internally construct one real
+# AnvilOpenArmFollower/AnvilOpenArmLeader per `arms` list entry below and
+# delegate to them; they are a strict superset (a 1-entry `arms` list
+# reproduces the single-arm classes' exact behavior/shapes -- see this
+# branch's offline tests), so this config and train_rl_push_bottle_jointspace.yaml
+# can coexist indefinitely without the single-arm path changing at all.
+#
+# Joint/camera ordering convention used throughout this file (state,
+# action, and the `arms` lists below) is LEFT ARM FIRST, then RIGHT ARM --
+# 7 left joints followed by 7 right joints for state/action, matching the
+# [left_joints..., right_joints...] convention already established
+# elsewhere in this project (configs/lerobot_control/inference_default.yaml,
+# configs/mcap_converter/openarm_bimanual.yaml).
+#
+# Camera topic names (/cam_waist, /cam_wrist_r, /cam_chest, /cam_wrist_l,
+# all .../image_raw/compressed) are this project's REAL, already-used
+# naming convention for the bimanual rig's 4 cameras -- taken directly
+# from configs/mcap_converter/openarm_bimanual.yaml and
+# configs/lerobot_control/inference_default.yaml's camera mappings, not
+# invented here. wrist_l/wrist_r are each wired to their own arm's
+# AnvilOpenArmFollower sub-controller below; waist/chest (fixed scene
+# views, not arm-mounted) are wired to the right arm's sub-controller
+# purely as an implementation detail of which ROS2 node subscribes to
+# them -- camera ownership between sub-controllers has no behavioral
+# effect, since AnvilOpenArmMultiFollower.get_observation() merges every
+# arm's images into one combined observation dict regardless of which
+# arm's node received them.
+#
+# Usage -- BC pretrain (offline, no robot/ROS2 needed at runtime), live
+# actor/learner -- identical usage pattern to train_rl_push_bottle_jointspace.yaml,
+# just pointed at this config instead. Not yet run on real bimanual
+# hardware -- see this branch's design note for the full list of what
+# still needs real-hardware validation before this is actor/learner-ready
+# (dataset/demos for bimanual don't exist yet either; this config has no
+# `dataset:`/`policy.pretrained_path` block for that reason -- add both
+# once bimanual demos exist, mirroring train_rl_push_bottle_jointspace.yaml's).
+
+env:
+  type: gym_manipulator
+  name: real_robot
+  fps: 10
+
+  features:
+    state:
+      type: STATE
+      shape: [14]
+    wrist_l_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    wrist_r_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    waist_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    chest_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    joint_action:
+      type: ACTION
+      shape: [14]
+  features_map:
+    state: observation.state
+    wrist_l_image: observation.images.wrist_l
+    wrist_r_image: observation.images.wrist_r
+    waist_image: observation.images.waist
+    chest_image: observation.images.chest
+    joint_action: action
+
+  robot:
+    type: anvil_openarm_multi_follower
+    arms:
+      - ros_prefix: follower_l
+        joint_state_topic: /joint_states
+        command_topic: /follower_l_forward_position_controller/commands
+        num_joints: 7
+        camera_topics:
+          wrist_l: /cam_wrist_l/image_raw/compressed
+        control_frequency: 10.0
+        max_position_delta: 0.08
+        max_command_step_rad: 0.06
+        obs_timeout_s: 2.0
+      - ros_prefix: follower_r
+        joint_state_topic: /joint_states
+        command_topic: /follower_r_forward_position_controller/commands
+        num_joints: 7
+        camera_topics:
+          wrist_r: /cam_wrist_r/image_raw/compressed
+          waist: /cam_waist/image_raw/compressed
+          chest: /cam_chest/image_raw/compressed
+        control_frequency: 10.0
+        max_position_delta: 0.08
+        max_command_step_rad: 0.06
+        obs_timeout_s: 2.0
+
+  teleop:
+    type: anvil_openarm_multi_leader
+    arms:
+      - ros_prefix: leader_l
+        joint_state_topic: /joint_states
+        num_joints: 7
+        urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+        target_frame_name: leader_l_hand_tcp
+        step_sizes:
+          x: 0.02
+          y: 0.02
+          z: 0.02
+        obs_timeout_s: 2.0
+        policy_controller: follower_l_forward_position_controller
+        teleop_controller: teleop_controller
+        follower_command_topic: /follower_l_forward_position_controller/commands
+        follower_joint_prefix: follower_l
+        # joint_space is REQUIRED for every arm in a multi-leader -- see
+        # AnvilOpenArmMultiLeader's docstring for why ee_delta cannot
+        # generalize to multiple arms (construction fails loudly if any
+        # arm omits this or sets it to ee_delta).
+        action_mode: joint_space
+      - ros_prefix: leader_r
+        joint_state_topic: /joint_states
+        num_joints: 7
+        urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+        target_frame_name: leader_r_hand_tcp
+        step_sizes:
+          x: 0.02
+          y: 0.02
+          z: 0.02
+        obs_timeout_s: 2.0
+        policy_controller: follower_r_forward_position_controller
+        teleop_controller: teleop_controller
+        follower_command_topic: /follower_r_forward_position_controller/commands
+        follower_joint_prefix: follower_r
+        action_mode: joint_space
+
+  processor:
+    control_mode: leader
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false
+      display_cameras: false
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+    gripper:
+      use_gripper: false
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 18.0
+      control_time_s: 20.0
+      terminate_on_success: true
+    # null, not an inverse_kinematics block -- see this file's header and
+    # train_rl_push_bottle_jointspace.yaml's own processor.inverse_kinematics
+    # comment: this is what makes action_processor reduce to just
+    # intervention/reward handling (no EE-delta/IK, which is hardcoded to
+    # a single 3-dim ee.x/y/z action and has no bimanual equivalent),
+    # letting the policy's raw 14-dim joint-position output flow straight
+    # to env.step() for both arms at once.
+    inverse_kinematics: null
+    reward_classifier: null
+
+policy:
+  type: sac
+  vision_encoder_name: /workspace/configs/hilserl/resnet10
+  device: cuda
+  push_to_hub: false
+  storage_device: cuda
+  use_torch_compile: false
+  policy_kwargs:
+    std_max: 0.5
+  online_steps: 4000
+  online_step_before_learning: 10
+  temperature_init: 0.01
+  online_buffer_capacity: 2000
+  offline_buffer_capacity: 4000
+  actor_learner_config:
+    learner_host: 127.0.0.1
+    learner_port: 50051
+
+output_dir: outputs/hilserl_push_bottle_bimanual_jointspace
+job_name: hilserl_push_bottle_bimanual_jointspace
+seed: 42
+batch_size: 256
+save_freq: 250
+wandb:
+  enable: false
