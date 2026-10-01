@@ -1,0 +1,152 @@
+# =============================================================================
+# HIL-SERL: push-bottle, bimanual (2-arm, 4-camera) joint-space RECORDING config
+# =============================================================================
+# GymManipulatorConfig structure per lerobot/rl/gym_manipulator.py -- this is
+# the recording-only (no RL) counterpart to
+# train_rl_push_bottle_bimanual_jointspace.yaml, needed because that file has
+# no `dataset:`/`policy.pretrained_path` yet: no bimanual demos exist. This
+# config's only job is to collect the first batch, exactly mirroring how
+# env_push_bottle.yaml did for the single-arm task.
+#
+# Usage: ros2 run lerobot_control hilserl_gym_manipulator --config_path <this file>
+#
+# Same composite classes, same joint-space convention
+# (processor.inverse_kinematics: null, LEFT-then-RIGHT 14-dim state/action)
+# as train_rl_push_bottle_bimanual_jointspace.yaml -- see that file's header
+# for the full rationale. Keep the two files' `env:` blocks in sync if either
+# changes (camera topics, controller names, per-arm limits).
+
+env:
+  type: gym_manipulator
+  name: real_robot
+  fps: 10
+
+  features:
+    state:
+      type: STATE
+      shape: [14]
+    wrist_l_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    wrist_r_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    waist_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    chest_image:
+      type: VISUAL
+      shape: [128, 128, 3]
+    joint_action:
+      type: ACTION
+      shape: [14]
+  features_map:
+    state: observation.state
+    wrist_l_image: observation.images.wrist_l
+    wrist_r_image: observation.images.wrist_r
+    waist_image: observation.images.waist
+    chest_image: observation.images.chest
+    joint_action: action
+
+  robot:
+    type: anvil_openarm_multi_follower
+    arms:
+      - ros_prefix: follower_l
+        joint_state_topic: /joint_states
+        command_topic: /follower_l_forward_position_controller/commands
+        num_joints: 7
+        camera_topics:
+          wrist_l: /cam_wrist_l/image_raw/compressed
+        control_frequency: 10.0
+        max_position_delta: 0.08
+        max_command_step_rad: 0.06
+        obs_timeout_s: 2.0
+      - ros_prefix: follower_r
+        joint_state_topic: /joint_states
+        command_topic: /follower_r_forward_position_controller/commands
+        num_joints: 7
+        camera_topics:
+          wrist_r: /cam_wrist_r/image_raw/compressed
+          waist: /cam_waist/image_raw/compressed
+          chest: /cam_chest/image_raw/compressed
+        control_frequency: 10.0
+        max_position_delta: 0.08
+        max_command_step_rad: 0.06
+        obs_timeout_s: 2.0
+
+  teleop:
+    type: anvil_openarm_multi_leader
+    arms:
+      - ros_prefix: leader_l
+        joint_state_topic: /joint_states
+        num_joints: 7
+        urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+        target_frame_name: leader_l_hand_tcp
+        step_sizes:
+          x: 0.02
+          y: 0.02
+          z: 0.02
+        obs_timeout_s: 2.0
+        policy_controller: follower_l_forward_position_controller
+        teleop_controller: teleop_controller
+        follower_command_topic: /follower_l_forward_position_controller/commands
+        follower_joint_prefix: follower_l
+        action_mode: joint_space
+      - ros_prefix: leader_r
+        joint_state_topic: /joint_states
+        num_joints: 7
+        urdf_path: configs/hilserl/urdf/openarm_teleop_kinematics.urdf
+        target_frame_name: leader_r_hand_tcp
+        step_sizes:
+          x: 0.02
+          y: 0.02
+          z: 0.02
+        obs_timeout_s: 2.0
+        policy_controller: follower_r_forward_position_controller
+        teleop_controller: teleop_controller
+        follower_command_topic: /follower_r_forward_position_controller/commands
+        follower_joint_prefix: follower_r
+        action_mode: joint_space
+
+  processor:
+    control_mode: leader
+
+    observation:
+      add_joint_velocity_to_observation: false
+      add_current_to_observation: false
+      add_ee_pose_to_observation: false
+      display_cameras: false
+
+    image_preprocessing:
+      crop_params_dict: {}
+      resize_size: [128, 128]
+
+    gripper:
+      use_gripper: false
+
+    reset:
+      fixed_reset_joint_positions: null
+      reset_time_s: 18.0
+      control_time_s: 20.0
+      terminate_on_success: true
+
+    # null, not an inverse_kinematics block -- same joint-space escape
+    # hatch as the single-arm config and train_rl_push_bottle_bimanual_jointspace.yaml.
+    inverse_kinematics: null
+
+    reward_classifier: null  # v1: manual success/failure via keyboard, same as single-arm
+
+dataset:
+  repo_id: SSTC-AITeam/hilserl-push-bottle-bimanual-jointspace
+  # Mount the PARENT directory, not this exact path -- LeRobotDataset.create()
+  # refuses to create a dataset at a path that already exists, and a Docker
+  # bind-mount's target always presents as an existing directory. See
+  # env_push_bottle.yaml's identical comment for the full story.
+  root: /tmp/push_bottle_bimanual_host/push_bottle_bimanual_demos
+  task: "push the white bottle into the marked target zone"
+  num_episodes_to_record: 5  # start small, matches the single-arm task's original first batch
+  replay_episode: null
+  push_to_hub: false
+
+mode: record  # switch to null once ready for RL training (point train_rl_push_bottle_bimanual_jointspace.yaml's dataset: at this recorded dataset first)
+device: cuda

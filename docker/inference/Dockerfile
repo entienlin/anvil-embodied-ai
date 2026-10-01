@@ -4,14 +4,16 @@ FROM ros:jazzy-ros-base
 ARG LEROBOT_VERSION=0.5.1
 ARG LEROBOT_EXTRAS=""
 
-# Build provenance -- pass via `--build-arg GIT_COMMIT=$(git rev-parse HEAD)
-# --build-arg GIT_DIRTY=...` (scripts/build_hilserl_image.sh does this
-# automatically). Baked into BUILD_INFO.json below so a running container
-# can answer "what code is this, actually" without trusting that whoever
-# ran `docker build` remembered to rebuild after their last code change --
-# see session_provenance.py for the runtime side of this.
-ARG GIT_COMMIT=unknown
-ARG GIT_DIRTY=unknown
+# NOTE: GIT_COMMIT/GIT_DIRTY ARGs for build provenance are declared further
+# down, immediately before the one RUN step that uses them (right before
+# BUILD_INFO.json generation) -- NOT here. Docker/BuildKit busts cache for
+# every layer from an ARG's declaration point onward whenever its value
+# differs between builds, even if that layer doesn't reference the ARG.
+# scripts/build_hilserl_image.sh passes a fresh GIT_COMMIT on every build
+# (it changes after every commit), so declaring it this early would
+# invalidate the entire expensive pip/colcon chain below on every single
+# build -- confirmed directly: this caused two real builds to run 30+
+# minutes instead of the usual ~1-2 minutes before being traced to this.
 
 # Set environment
 ENV DEBIAN_FRONTEND=noninteractive

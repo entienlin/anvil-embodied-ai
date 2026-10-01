@@ -33,6 +33,44 @@ Current config: `configs/hilserl/train_rl_push_bottle_jointspace.yaml` (see
 `configs/hilserl/README.md` for the full config inventory -- there are
 several superseded/historical configs sitting alongside it).
 
+## Bimanual (2-arm, 4-camera) -- `feat/hilserl-bimanual-4cam` branch
+
+Branched from the single-arm joint-space work (`3ae6c26`, already includes
+every real-hardware fix from the single-arm marathon -- this branch is not
+missing anything, see its own merge history). Built as a genuine
+**composite**, not a fork of the single-arm classes: `AnvilOpenArmFollower`/
+`AnvilOpenArmLeader` are completely unmodified (beyond two small,
+documented, provably-backward-compatible changes -- an idempotent
+`KeyboardIntervention.start()` guard, and the liveness watchdog reading
+`is_any_leader_intervening()` instead of a single-leader lookup). Single-arm
+is the N=1 degenerate case of the same composite class, not a separate code
+path to keep in sync.
+
+| File | Role |
+|---|---|
+| `robot_anvil_openarm_multi.py` | `AnvilOpenArmMultiFollower` -- N real `AnvilOpenArmFollower`s, 1 combined `Robot` |
+| `teleop_anvil_openarm_multi_leader.py` | `AnvilOpenArmMultiLeader` -- N real `AnvilOpenArmLeader`s + ONE shared `KeyboardIntervention` |
+| `_bimanual1_composite_follower_test.py` | Offline: composite follower, incl. single-arm behavioral equivalence |
+| `_bimanual2_composite_leader_test.py` | Offline: composite leader, shared-keyboard + joint-space-only validation |
+| `_bimanual3_leader_registry_test.py` | Offline: `_registered_leaders` keyed-by-prefix, no overwrite with 2 leaders |
+
+Configs: `env_push_bottle_bimanual_jointspace.yaml` (recording, no RL --
+**use this first**, no bimanual demos exist yet) and
+`train_rl_push_bottle_bimanual_jointspace.yaml` (actor/learner; has no
+`dataset:`/`policy.pretrained_path` until the recording config above
+produces one). Real camera topics/controller names are taken directly from
+this project's already-verified single-arm facts, not invented.
+
+**Not yet real-hardware validated** -- offline (kinematics, composite
+class, regression test) verification only. `end_effector_bounds` safety
+doesn't apply here (`inverse_kinematics: null`, same as single-arm
+joint-space) -- the only safety net is each arm's own `ActionLimiter`/
+liveness watchdog, inherited for free since the composite delegates to
+real `AnvilOpenArmFollower` instances. Known open risk from the devbox,
+unrelated to this code: their camera `replay_buffer` node has been getting
+OOM-killed under the full 4-camera 1080p60 load (worth resolving before
+leaning on long bimanual sessions, see devbox coordination notes).
+
 ## Diagnostic tools (not part of the regular loop, kept for reference)
 
 These each answered a specific past question and are generic enough to be

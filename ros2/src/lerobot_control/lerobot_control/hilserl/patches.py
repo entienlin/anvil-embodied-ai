@@ -30,6 +30,10 @@ re-deriving it live during an active debugging session.
   2026-09-29  patch_leader_skip_reset_when_stopping
       The actor's own auto-stop can race the next episode's reset(),
       losing ROS context mid-homing-call for an episode that'll never run.
+  (bimanual branch)  patch_multi_leader_skip_reset_when_stopping
+      Bimanual counterpart to the patch above -- AnvilOpenArmMultiLeader's
+      perform_episode_reset_and_wait() lives on a different class, so the
+      single-arm patch never covers it; same stop/reset race otherwise.
   2026-09-22  patch_sac_deterministic_inference
       SACPolicy.select_action() resamples fresh stochastic noise every
       10Hz tick -- causes persistent per-tick "creeping" jitter on real

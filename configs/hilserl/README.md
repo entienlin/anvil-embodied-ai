@@ -17,6 +17,23 @@ bc_jointspace_v1`, mounted read-only at run time, not baked into this repo).
 **`eval_sac_jointspace_push_bottle.yaml`** -- matching eval-only config for
 the same joint-space checkpoint, used with `eval_checkpoint.py`.
 
+## Bimanual (2-arm, 4-camera) -- `feat/hilserl-bimanual-4cam` branch only
+
+**`env_push_bottle_bimanual_jointspace.yaml`** -- recording-only
+(`hilserl_gym_manipulator`, no RL). **Use this first** -- no bimanual demos
+exist yet, so `train_rl_push_bottle_bimanual_jointspace.yaml` below has
+nothing to train on until this produces a dataset.
+
+**`train_rl_push_bottle_bimanual_jointspace.yaml`** -- actor/learner
+config, same joint-space convention as the single-arm config, 14-dim
+state/action (left-then-right), 4 cameras. Has no `dataset:`/
+`policy.pretrained_path` yet -- add both once the recording config above
+has produced real demos, mirroring the single-arm config's own.
+
+Keep these two files' `env:` blocks (camera topics, controller names,
+per-arm limits) in sync if either changes -- see each file's own header
+comment.
+
 ## Historical / superseded (EE-delta era, before the 2026-09-30 joint-space pivot)
 
 These predate the finding that the EE-delta action label was causally
