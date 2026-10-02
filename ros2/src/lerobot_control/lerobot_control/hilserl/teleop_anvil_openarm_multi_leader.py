@@ -191,11 +191,56 @@ class AnvilOpenArmMultiLeader(Teleoperator):
         arm's own joint order) in config.arms' list order -- must match
         whatever order the env config's `features`/`features_map` declare
         the combined action in (document this in the env YAML, same as
-        the single-arm case already documents its 7-joint order)."""
+        the single-arm case already documents its 7-joint order).
+
+        Real-hardware finding (2026-10-02): each sub-arm's OWN get_action()
+        does its own edge detection and calls ITS OWN SwitchServiceClient
+        independently -- the exact same shared-teleop_controller conflict
+        perform_episode_reset_and_wait() already hit and fixed
+        (_combined_switch()), but THIS is the live per-tick path (every
+        control-loop tick, not just between episodes), confirmed directly:
+        "Unable to activate controller 'teleop_controller' since the
+        command interface 'follower_r_joint1/position' is currently
+        claimed by another controller" when leader_l's get_action() tried
+        to switch while follower_r_forward_position_controller was still
+        active -- 20 consecutive failures, then a hard crash. Since every
+        sub-arm shares the SAME KeyboardIntervention (one human, one
+        decision), their edge fires on the same tick -- so the fix is the
+        same pattern as the reset path: do ONE combined switch here first,
+        then pre-sync each sub-arm's internal _was_intervening/
+        _leader_ee_ref state to match so ITS OWN get_action() sees no edge
+        and never attempts its own independent switch call.
+        """
         import numpy as np
 
         if not self._is_connected:
             raise RuntimeError("AnvilOpenArmMultiLeader is not connected")
+
+        is_intervening = self._keyboard.is_intervention
+        any_arm_needs_switch = any(arm._was_intervening != is_intervening for arm in self._arms)
+        if any_arm_needs_switch:
+            if self._combined_switch(want_teleop=is_intervening):
+                for arm in self._arms:
+                    arm._pending_switch_retries = 0
+                    arm._was_intervening = is_intervening
+                    arm._leader_ee_ref = arm._leader_ee_position() if is_intervening else None
+            else:
+                for arm in self._arms:
+                    arm._pending_switch_retries += 1
+                    arm._node.get_logger().warning(
+                        f"AnvilOpenArmMultiLeader: combined switch to "
+                        f"{'teleop' if is_intervening else 'policy'} failed "
+                        f"(attempt {arm._pending_switch_retries}/20) -- will retry next tick, "
+                        "followers may be unheld until this succeeds"
+                    )
+                if any(arm._pending_switch_retries >= 20 for arm in self._arms):
+                    raise RuntimeError(
+                        f"AnvilOpenArmMultiLeader: combined switch to "
+                        f"{'teleop' if is_intervening else 'policy'} failed 20 consecutive "
+                        "times -- giving up rather than retrying forever with the followers "
+                        "in an unknown state."
+                    )
+
         parts = [arm.get_action() for arm in self._arms]
         return np.concatenate([np.asarray(p, dtype=np.float32) for p in parts])
 
