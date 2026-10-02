@@ -169,6 +169,19 @@ docker compose -f "$COMPOSE_FILE" "${PASSTHROUGH[@]}" --remove-orphans
 COMPOSE_EXIT=$?
 set -e
 
+# A rebuild (--build) retags whatever image the compose file builds,
+# orphaning the previous image under that tag -- it becomes "dangling"
+# (untagged, still full size on disk) rather than being freed. Found
+# 2026-10-01: ~150GB of these had piled up across months of rebuilds here
+# and in the hilserl workflow, nobody ever pruning. `docker image prune -f`
+# only removes genuinely dangling images (never a currently-tagged image,
+# a running container's image, or build cache), so it's safe to run
+# unconditionally right after any run that rebuilt something.
+if [[ " ${PASSTHROUGH[*]} " == *" --build "* ]]; then
+    echo "[run_inference] pruning dangling images from the rebuild..."
+    docker image prune -f
+fi
+
 # Auto-plot monitor CSV after production monitor run
 if [[ "$REAL_MONITOR" == true ]]; then
     CSV="${MONITOR_DIR}/inference_data.csv"
