@@ -577,13 +577,17 @@ class AnvilOpenArmFollower(Robot):
         observed_range = float(np.max(observed_stack.max(axis=0) - observed_stack.min(axis=0)))
         if observed_range < self._LIVENESS_STILL_THRESHOLD_RAD:
             raise RuntimeError(
-                f"AnvilOpenArmFollower: liveness watchdog tripped -- commanded "
-                f"real movement (>{self._LIVENESS_COMMAND_THRESHOLD_RAD} rad delta) "
+                f"AnvilOpenArmFollower({self.config.ros_prefix}): liveness watchdog "
+                f"tripped -- commanded real movement "
+                f"(>{self._LIVENESS_COMMAND_THRESHOLD_RAD} rad delta) "
                 f"for {self._LIVENESS_WINDOW_SIZE} consecutive ticks but observed "
                 f"joint position only moved {observed_range:.5f} rad over that same "
                 f"window (threshold {self._LIVENESS_STILL_THRESHOLD_RAD} rad). The "
-                "arm appears unresponsive -- see the recurring 'follower dead' "
-                "fault investigation in the HIL-SERL plan."
+                f"{self.config.ros_prefix} arm appears unresponsive -- see the "
+                "recurring 'follower dead' fault investigation in the HIL-SERL plan. "
+                "(2026-10-02: this message used to omit which arm, forcing physical "
+                "observation to tell which one faulted in a bimanual run -- fixed "
+                "after the first live bimanual actor session needed exactly that.)"
             )
 
     def send_action(self, action: dict) -> dict:
