@@ -17,7 +17,6 @@
 # changes (camera topics, controller names, per-arm limits).
 
 env:
-  type: gym_manipulator
   name: real_robot
   fps: 10
 

@@ -25,7 +25,9 @@ Usage:
 """
 
 from lerobot_control.hilserl import robot_anvil_openarm  # noqa: F401 -- registration side effect
+from lerobot_control.hilserl import robot_anvil_openarm_multi  # noqa: F401 -- registration side effect
 from lerobot_control.hilserl import teleop_anvil_openarm_leader  # noqa: F401 -- registration side effect
+from lerobot_control.hilserl import teleop_anvil_openarm_multi_leader  # noqa: F401 -- registration side effect
 
 
 def main() -> None:
