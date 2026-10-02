@@ -82,6 +82,35 @@ def main() -> int:
     ok &= _check("real config: robot has 2 arms", len(cfg.env.robot.arms) == 2)
     ok &= _check("real config: teleop has 2 arms", len(cfg.env.teleop.arms) == 2)
 
+    print(
+        "\n[bimanual4] make_robot_from_config()/make_teleoperator_from_config() "
+        "actually construct the composite classes (not just resolve config types)...",
+        flush=True,
+    )
+    # This is the SECOND bug found on real hardware (2026-10-02): draccus's
+    # config registry (checked above) is a completely separate mechanism
+    # from lerobot.utils.import_utils.make_device_from_device_class, which
+    # robots/utils.py::make_robot_from_config falls back to for any
+    # config.type not in its own hardcoded if/elif chain -- it derives a
+    # device module/class name from the Config class name and searches a
+    # short candidate list, the first of which is this package's own
+    # __init__.py namespace. Registering the Config class does NOT by
+    # itself make the Robot/Teleoperator class importable there -- see
+    # __init__.py's own docstring. Construction only (no .connect(), which
+    # needs live ROS2 services) -- AnvilOpenArmMultiFollower/
+    # AnvilOpenArmMultiLeader's __init__ does no network I/O, confirmed by
+    # _bimanual1/_bimanual2 already constructing them directly offline.
+    from lerobot.robots.utils import make_robot_from_config
+    from lerobot.teleoperators.utils import make_teleoperator_from_config
+
+    robot = make_robot_from_config(cfg.env.robot)
+    ok &= _check("make_robot_from_config() returns an AnvilOpenArmMultiFollower", type(robot).__name__ == "AnvilOpenArmMultiFollower")
+    ok &= _check("constructed robot has 2 sub-arms", len(robot._arms) == 2)
+
+    teleop = make_teleoperator_from_config(cfg.env.teleop)
+    ok &= _check("make_teleoperator_from_config() returns an AnvilOpenArmMultiLeader", type(teleop).__name__ == "AnvilOpenArmMultiLeader")
+    ok &= _check("constructed teleop has 2 sub-arms", len(teleop._arms) == 2)
+
     if not ok:
         print("\n[bimanual4] FAILED", flush=True)
         return 1

@@ -18,4 +18,6 @@ an ImportError during Stage 3 testing before this re-export was added.
 """
 
 from .robot_anvil_openarm import AnvilOpenArmFollower, AnvilOpenArmFollowerConfig  # noqa: F401
+from .robot_anvil_openarm_multi import AnvilOpenArmMultiFollower, AnvilOpenArmMultiFollowerConfig  # noqa: F401
 from .teleop_anvil_openarm_leader import AnvilOpenArmLeader, AnvilOpenArmLeaderConfig  # noqa: F401
+from .teleop_anvil_openarm_multi_leader import AnvilOpenArmMultiLeader, AnvilOpenArmMultiLeaderConfig  # noqa: F401

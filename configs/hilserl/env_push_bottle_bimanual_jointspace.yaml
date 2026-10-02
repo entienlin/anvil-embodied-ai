@@ -144,13 +144,13 @@ dataset:
   root: /tmp/push_bottle_bimanual_host/push_bottle_bimanual_demos
   # Two independent, uncoordinated pushes (no gripper yet) -- right arm
   # pushes a yellow ornament between its own two red marks, left arm pushes
-  # a transparent blue bowl between its own (different) two red marks.
+  # a light blue plate between its own (different) two red marks.
   # Intentionally the easy first bimanual task: validates both arms'
   # recording/mirroring/cameras without needing any cross-arm timing or
   # coordination. Eventual goal (needs gripper, not yet wired into this
   # config: processor.gripper.use_gripper is false): pick up the yellow
-  # object and place it into the blue bowl -- a real coordinated task.
-  task: "right arm pushes the yellow object from its start mark to its target mark; left arm pushes the blue bowl from its start mark to its target mark"
+  # object and place it onto the plate -- a real coordinated task.
+  task: "right arm pushes the yellow object from its start mark to its target mark; left arm pushes the light blue plate from its start mark to its target mark"
   num_episodes_to_record: 5  # start small, matches the single-arm task's original first batch
   replay_episode: null
   push_to_hub: false
