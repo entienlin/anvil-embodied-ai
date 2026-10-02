@@ -284,11 +284,34 @@ class AnvilOpenArmFollower(Robot):
 
         # Fail loudly if no data ever arrives, rather than hanging forever
         # the first time get_observation() is actually called.
+        #
+        # Diagnostic logging added 2026-10-02: a bimanual connect() attempt
+        # with 4 ROS2 nodes (2 followers + 2 leaders) now running in one
+        # process, follower_r alone subscribing to 3 cameras sharing one
+        # MutuallyExclusiveCallbackGroup, timed out waiting for a complete
+        # observation even at a generous 15s -- despite all 4 real topics
+        # independently confirmed publishing at healthy rates moments
+        # later. Unknown whether this is uneven throughput (all cameras
+        # eventually arrive, just slower than before) or a harder
+        # starvation/scheduling issue (some specific camera never gets a
+        # single callback at all) -- this periodic log (every ~2s) plus
+        # _make_image_cb's one-shot "first frame received" log make that
+        # distinction visible in the next real attempt instead of guessing.
         deadline = time.monotonic() + self.config.obs_timeout_s * 3
+        last_progress_log = 0.0
         while time.monotonic() < deadline:
             if self._obs_manager.has_complete_observation(list(self.config.camera_topics)):
                 self._seed_heartbeat_from_current_position()
                 return
+            now = time.monotonic()
+            if now - last_progress_log > 2.0:
+                last_progress_log = now
+                missing_cameras = [c for c in self.config.camera_topics if c not in self._obs_manager.latest_images]
+                self._node.get_logger().info(
+                    f"AnvilOpenArmFollower: still waiting for complete observation -- "
+                    f"joint_state={'OK' if self._obs_manager.latest_joint_state is not None else 'MISSING'}, "
+                    f"missing_cameras={missing_cameras}"
+                )
             time.sleep(0.05)
         raise RuntimeError(
             f"AnvilOpenArmFollower: no complete observation within "
@@ -425,6 +448,10 @@ class AnvilOpenArmFollower(Robot):
 
     def _make_image_cb(self, cam_name: str):
         def _cb(msg: CompressedImage) -> None:
+            if cam_name not in self._obs_manager.latest_images:
+                self._node.get_logger().info(
+                    f"AnvilOpenArmFollower: first frame received for camera '{cam_name}'"
+                )
             img = self._image_converter.compressed_imgmsg_to_numpy(msg, desired_encoding="rgb8")
             self._obs_manager.update_image(cam_name, img)
 
