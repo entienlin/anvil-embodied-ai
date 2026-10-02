@@ -42,3 +42,15 @@ docker build \
     .
 
 echo "[build_hilserl_image] built hilserl-test from ${GIT_COMMIT} (${GIT_DIRTY})"
+
+# Every rebuild that reuses the `hilserl-test` tag orphans the PREVIOUS
+# image under that tag -- Docker just moves the tag, it doesn't delete the
+# old image, which becomes "dangling" (untagged, still full size on disk).
+# Found 2026-10-01: ~150GB of these had piled up across months of manual
+# rebuilds with nobody ever pruning. `docker image prune -f` only removes
+# genuinely dangling images (untagged, not a parent layer of anything that
+# IS tagged) -- never a currently-tagged image, a running container's
+# image, or build cache -- so this is safe to run unconditionally after
+# every build rather than something that needs remembering separately.
+echo "[build_hilserl_image] pruning dangling images from the previous build..."
+docker image prune -f
