@@ -230,8 +230,21 @@ class AnvilOpenArmFollower(Robot):
         # publisher side) is what a live occurrence showed via per-tick
         # trace data. Separate callback groups let rclpy schedule joint_state
         # and image callbacks on different threads instead of serializing them.
+        # Real bimanual finding (2026-10-02): all cameras on one arm used to
+        # share a SINGLE image_cbg -- harmless for single-arm's 1-camera
+        # case (nothing to share with), but follower_r's 3 cameras sharing
+        # one MutuallyExclusiveCallbackGroup meant only one of their
+        # callbacks could ever be "in flight" at a time. Confirmed directly
+        # via the connect()-wait diagnostic log: wrist_r and waist each got
+        # their first frame within ~1s, while chest (the last-registered
+        # subscription in the group) never received a single callback in a
+        # full 15s window -- not a dead topic (independently confirmed
+        # publishing at a healthy 60Hz), a real starvation/fairness issue
+        # within the shared exclusive group under load (4 ROS2 nodes, one
+        # publishing /joint_states at ~480Hz, all in one process). Fix:
+        # ONE callback group PER camera, so they're scheduled independently
+        # rather than competing for one exclusive slot.
         joint_state_cbg = MutuallyExclusiveCallbackGroup()
-        image_cbg = MutuallyExclusiveCallbackGroup()
 
         self._node.create_subscription(
             JointState, self.config.joint_state_topic, self._on_joint_state, 10,
@@ -240,7 +253,7 @@ class AnvilOpenArmFollower(Robot):
         for cam_name, topic in self.config.camera_topics.items():
             self._node.create_subscription(
                 CompressedImage, topic, self._make_image_cb(cam_name), 10,
-                callback_group=image_cbg,
+                callback_group=MutuallyExclusiveCallbackGroup(),
             )
         self._pub = self._node.create_publisher(Float64MultiArray, self.config.command_topic, 10)
 
@@ -259,7 +272,12 @@ class AnvilOpenArmFollower(Robot):
         # how many other Robot/Teleoperator instances exist in the process.
         # MultiThreadedExecutor (not Single-) so the separate callback groups
         # above can actually run concurrently -- see their comment.
-        self._executor = MultiThreadedExecutor(num_threads=3)
+        # num_threads scales with callback-group count (1 joint_state + 1
+        # per camera) + 1 spare, not a fixed 3 -- fixed sizing was fine when
+        # every arm had exactly 1 camera (2 groups) but under-provisions
+        # follower_r's 3-camera case (4 groups) now that each camera has its
+        # own group instead of sharing one.
+        self._executor = MultiThreadedExecutor(num_threads=len(self.config.camera_topics) + 2)
         self._executor.add_node(self._node)
 
         self._spin_stop.clear()
