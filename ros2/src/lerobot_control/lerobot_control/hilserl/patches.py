@@ -70,7 +70,12 @@ re-deriving it live during an active debugging session.
       SAC's batched (1,N) action tensor was never squeezed/CPU-transferred
       for the joint-space path (EE-delta's IK chain squeezed it by
       coincidence) -- crashed env.step(). Also adds ACTOR_TRACE_OUT
-      per-tick trace logging.
+      per-tick trace logging. (2026-10-02, bimanual) also replaces
+      control_loop()'s hardcoded 3-element non-intervening "neutral_action"
+      with the robot's real current joint positions when it's shorter than
+      the robot's actual joint count -- the EE-delta IK chain always fixed
+      this up before reaching env.step(), joint-space mode has no such
+      chain to rely on.
   2026-09-21  patch_learner_stop_at_online_steps
       lerobot's learner loop never exits on reaching online_steps -- kept
       re-training on the same finite buffer forever (seen: 4000+ steps for
@@ -1177,6 +1182,33 @@ def patch_step_env_squeezes_batched_action() -> None:
             processed_action = processed_action.detach().cpu()
         if hasattr(processed_action, "dim") and processed_action.dim() > 1:
             processed_action = processed_action.squeeze(0)
+
+        # Real bimanual-recording finding (2026-10-02): control_loop()'s
+        # non-intervening tick always sends a HARDCODED 3-element (4 with
+        # gripper) "neutral_action" -- a stock lerobot EE-delta-era
+        # assumption (lerobot/rl/gym_manipulator.py's own control_loop()).
+        # For ee_delta configs this is harmless: InverseKinematicsRLStep
+        # converts it into a real-joint-count action regardless of
+        # intervention state. For joint-space configs
+        # (processor.inverse_kinematics: null), that whole IK chain is
+        # skipped by design, so the 3-element placeholder reaches env.step()
+        # unchanged whenever IS_INTERVENTION is False -- crashing with
+        # `IndexError: index 3 is out of bounds for dimension 0 with size 3`
+        # the moment a robot has more than 3 joints (hit on the very first
+        # bimanual attempt at 14 joints; every single-arm session so far
+        # happened to have the human intervening from the first tick, which
+        # is why this was never triggered at 7 joints either).
+        #
+        # Fix: if the action is shorter than the robot's real joint count,
+        # replace it with the robot's OWN CURRENT joint positions (a
+        # genuine "hold still"), not zeros -- joint-space actions are
+        # absolute next-tick positions, not deltas, so padding/replacing
+        # with 0.0 would command a real, large, unsafe motion toward
+        # whatever "0 degrees for every joint" happens to be, not a no-op.
+        real_joint_names = list(env.robot.bus.motors.keys())
+        if len(processed_action) < len(real_joint_names):
+            current_obs = env.robot.get_observation()
+            processed_action = [current_obs[f"{j}.pos"] for j in real_joint_names]
 
         obs, reward, terminated, truncated, info = env.step(processed_action)
         _trace_tick(before_obs, processed_action, obs)
