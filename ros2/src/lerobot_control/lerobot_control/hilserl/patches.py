@@ -1220,8 +1220,32 @@ def patch_step_env_squeezes_batched_action() -> None:
         new_info = processed_action_transition[TransitionKey.INFO].copy()
         new_info.update(info)
 
+        # Real bimanual-recording finding (2026-10-02): env_processor's own
+        # batch-action step (to_batch_action_processor) requires a
+        # torch.Tensor ("Action should be a PolicyAction type (tensor), but
+        # got <class 'list'>") -- but for joint-space configs,
+        # InterventionActionProcessorStep's ndarray branch (used whenever
+        # actually intervening, confirmed via a real pressed-space episode
+        # tonight) produces action.tolist(), a plain Python list, and
+        # nothing downstream re-wraps it as a tensor the way the ee_delta/IK
+        # chain happens to. Never caught before because this is the FIRST
+        # time hilserl_gym_manipulator has ever actually RECORDED in
+        # joint-space mode for either arm count -- single-arm's own
+        # joint-space training data (demos_v2_jointspace) was relabeled from
+        # an old ee_delta recording, never recorded fresh this way. Convert
+        # right before building the transition that env_processor will see
+        # -- env.step() above already received the untouched list/array
+        # form and that path is unaffected.
+        import torch as _torch
+
+        action_for_transition = (
+            processed_action
+            if isinstance(processed_action, _torch.Tensor)
+            else _torch.as_tensor(processed_action, dtype=_torch.float32)
+        )
+
         new_transition = create_transition(
-            observation=obs, action=processed_action, reward=reward, done=terminated,
+            observation=obs, action=action_for_transition, reward=reward, done=terminated,
             truncated=truncated, info=new_info, complementary_data=complementary_data,
         )
         return env_processor(new_transition)
