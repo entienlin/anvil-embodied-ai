@@ -1220,6 +1220,28 @@ def patch_step_env_squeezes_batched_action() -> None:
         new_info = processed_action_transition[TransitionKey.INFO].copy()
         new_info.update(info)
 
+        # Real bimanual-recording finding (2026-10-02), second half of the
+        # neutral_action problem above: InterventionActionProcessorStep
+        # (lerobot/processor/hil_processor.py) only overwrites
+        # complementary_data["teleop_action"] with the REAL action while
+        # `is_intervention` is True -- on a non-intervening tick it leaves
+        # that key as whatever action came in (the 3-element neutral_action
+        # placeholder), regardless of the fix above, which only affects
+        # what's actually SENT to the robot. control_loop()'s own recording
+        # logic reads `complementary_data.get("teleop_action", ...)`
+        # specifically for the saved dataset frame -- confirmed on real
+        # hardware: `ValueError: The feature 'action' of shape '(3,)' does
+        # not have the expected shape '(14,)'` the first time a
+        # non-intervening tick's frame was actually saved. Same fix,
+        # applied to the recorded value too: reuse the already-corrected
+        # `processed_action` (guaranteed real-joint-count by this point)
+        # whenever the recorded teleop_action is undersized.
+        recorded_teleop_action = complementary_data.get("teleop_action")
+        if recorded_teleop_action is not None and len(recorded_teleop_action) < len(real_joint_names):
+            import torch as _torch_recorded
+
+            complementary_data["teleop_action"] = _torch_recorded.as_tensor(processed_action, dtype=_torch_recorded.float32)
+
         # Real bimanual-recording finding (2026-10-02): env_processor's own
         # batch-action step (to_batch_action_processor) requires a
         # torch.Tensor ("Action should be a PolicyAction type (tensor), but
