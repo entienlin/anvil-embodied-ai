@@ -45,12 +45,17 @@
 #
 # Usage -- BC pretrain (offline, no robot/ROS2 needed at runtime), live
 # actor/learner -- identical usage pattern to train_rl_push_bottle_jointspace.yaml,
-# just pointed at this config instead. Not yet run on real bimanual
-# hardware -- see this branch's design note for the full list of what
-# still needs real-hardware validation before this is actor/learner-ready
-# (dataset/demos for bimanual don't exist yet either; this config has no
-# `dataset:`/`policy.pretrained_path` block for that reason -- add both
-# once bimanual demos exist, mirroring train_rl_push_bottle_jointspace.yaml's).
+# just pointed at this config instead.
+#
+# dataset: now points at the first 10 real bimanual demos (2026-10-02,
+# env_push_bottle_bimanual_jointspace.yaml recording sessions -- two
+# 5-episode batches merged via lerobot.datasets.dataset_tools.merge_datasets()
+# into one combined dataset, episode_index 0-9, 724 frames total, all
+# successful). policy.pretrained_path is intentionally absent for the
+# first BC pretrain run (produces a fresh checkpoint via BC_OUT) -- add it
+# back, mirroring train_rl_push_bottle_jointspace.yaml's own comment, once
+# a checkpoint exists and this config is used for live actor/learner
+# instead of BC pretraining.
 
 env:
   type: gym_manipulator
@@ -179,6 +184,13 @@ env:
     # to env.step() for both arms at once.
     inverse_kinematics: null
     reward_classifier: null
+
+# root is a container-internal path -- mount the HOST directory via
+# `-v .../data/datasets/push_bottle_bimanual_demos_combined:/tmp/push_bottle_bimanual_demos_combined:ro`.
+dataset:
+  repo_id: SSTC-AITeam/hilserl-push-bottle-bimanual-jointspace
+  root: /tmp/push_bottle_bimanual_demos_combined
+  video_backend: pyav
 
 policy:
   type: sac

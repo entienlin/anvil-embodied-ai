@@ -71,7 +71,9 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 
 from lerobot_control.hilserl import robot_anvil_openarm  # noqa: F401 -- registration side effect
+from lerobot_control.hilserl import robot_anvil_openarm_multi  # noqa: F401 -- registration side effect
 from lerobot_control.hilserl import teleop_anvil_openarm_leader  # noqa: F401 -- registration side effect
+from lerobot_control.hilserl import teleop_anvil_openarm_multi_leader  # noqa: F401 -- registration side effect
 
 import lerobot.policies.sac.configuration_sac  # noqa: F401,E402 -- registers the "sac" policy choice for draccus
 import lerobot.policies.sac.modeling_sac  # noqa: F401,E402
