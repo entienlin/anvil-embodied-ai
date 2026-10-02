@@ -195,6 +195,14 @@ dataset:
 policy:
   type: sac
   vision_encoder_name: /workspace/configs/hilserl/resnet10
+  # bc_bimanual_v1 (held-out corr mean +0.939, see the BC pretrain log
+  # 2026-10-02) -- mount it at this exact path via
+  # `-v .../outputs/bc_bimanual_v1:/workspace/configs/hilserl/bc_bimanual_poc:ro`.
+  # For a NEW BC pretrain run instead (producing a fresh checkpoint via
+  # BC_OUT), comment this out -- bc_pretrain.py's make_policy() call uses
+  # this same policy: block, and a non-empty pretrained_path there would
+  # load and start FROM this checkpoint rather than from scratch.
+  pretrained_path: /workspace/configs/hilserl/bc_bimanual_poc
   device: cuda
   push_to_hub: false
   storage_device: cuda
