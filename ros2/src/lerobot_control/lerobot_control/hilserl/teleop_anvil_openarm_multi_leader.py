@@ -230,8 +230,12 @@ class AnvilOpenArmMultiLeader(Teleoperator):
                     arm._node.get_logger().warning(
                         f"AnvilOpenArmMultiLeader: combined switch to "
                         f"{'teleop' if is_intervening else 'policy'} failed "
-                        f"(attempt {arm._pending_switch_retries}/20) -- will retry next tick, "
-                        "followers may be unheld until this succeeds"
+                        f"(attempt {arm._pending_switch_retries}/20) -- will retry next tick. "
+                        "The failure itself means each follower's interfaces are still held "
+                        "by whichever controller was already active -- NOT unheld; the "
+                        "handoff just hasn't taken effect yet (confirmed via real "
+                        "motor-status data, 2026-10-02: both followers stayed continuously "
+                        "held throughout a real ~8s retry sequence, never went ownerless)."
                     )
                 if any(arm._pending_switch_retries >= 20 for arm in self._arms):
                     raise RuntimeError(

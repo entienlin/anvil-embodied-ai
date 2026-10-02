@@ -491,7 +491,13 @@ class AnvilOpenArmLeader(Teleoperator):
             f"AnvilOpenArmLeader: switch to "
             f"{'teleop' if target_was_intervening else 'policy'} failed "
             f"(attempt {self._pending_switch_retries}/{MAX_CONSECUTIVE_SWITCH_FAILURES}) "
-            "-- will retry next tick, follower may be unheld until this succeeds"
+            "-- will retry next tick. The failure itself means the OTHER "
+            "controller still holds the command interface, so the follower "
+            "stays actively held (at its last commanded target) by whichever "
+            "controller it was already on -- NOT unheld; the handoff just "
+            "hasn't taken effect yet (confirmed via real motor-status data, "
+            "2026-10-02, after this exact retry sequence: both followers "
+            "stayed continuously held throughout, never went ownerless)."
         )
         if self._pending_switch_retries >= MAX_CONSECUTIVE_SWITCH_FAILURES:
             raise RuntimeError(
