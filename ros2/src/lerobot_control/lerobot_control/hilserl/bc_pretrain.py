@@ -168,7 +168,16 @@ def _smooth(a: np.ndarray, k: int) -> np.ndarray:
 
 
 class _Arrays(torch.utils.data.Dataset):
-    """In-memory frames (from actor trajectory files)."""
+    """In-memory frames (from actor trajectory files).
+
+    NOT yet generalized to N cameras like _Frames above was (2026-10-02) --
+    this path (BC_TRAJ_DIRS, DAgger-style corrections from saved actor
+    trajectories) is single-camera only (hardcodes "observation.images.wrist_r"
+    below), since save_actor_trajectory() itself only ever saved one
+    camera's frames. Not a blocker for the first bimanual BC pretrain (no
+    saved trajectories exist yet to correct from), but will need the same
+    treatment as _Frames before a bimanual DAgger round is possible.
+    """
 
     def __init__(self, state, image, targets, raw):
         self.state, self.image, self.targets, self.raw = state, image, targets, raw
@@ -261,6 +270,23 @@ def bc_pretrain(cfg) -> None:
     device = torch.device(cfg.policy.device)
     policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env)
     policy.train()
+
+    # Real bimanual finding (2026-10-02): _KEYS was hardcoded to
+    # single-arm's one camera ("observation.images.wrist_r") -- this script
+    # was never generalized to N cameras. Crashed with
+    # `KeyError: 'observation.images.wrist_l'` inside SACPolicy's own
+    # get_cached_image_features() the first time this ran against a
+    # 4-camera bimanual config: _Frames.__getitem__ only ever selected the
+    # one hardcoded key out of the real dataset item (which already has
+    # every camera's decoded frame -- LeRobotDataset.__getitem__ is
+    # generic), so the batch handed to the policy's encoder was missing 3
+    # of its 4 expected image keys. Derive the real camera keys from the
+    # already-constructed policy itself (policy.actor.encoder.image_keys,
+    # the exact same list get_cached_image_features() iterates) rather than
+    # guessing -- generalizes correctly to 1 camera (single-arm, unchanged
+    # behavior) or N (bimanual).
+    global _KEYS
+    _KEYS = ("observation.state", *policy.actor.encoder.image_keys)
 
     sources = []
     if env("BC_SKIP_BASE") != "1":  # BC_SKIP_BASE=1: train ONLY on BC_EXTRA_DATASETS
