@@ -221,6 +221,52 @@ class AnvilOpenArmMultiLeader(Teleoperator):
     def send_feedback(self, feedback: dict) -> None:
         pass
 
+    def _combined_switch(self, want_teleop: bool) -> bool:
+        """Single switch_controller call covering every arm's own policy
+        controller together with the ONE shared teleop_controller.
+
+        Real-hardware finding (2026-10-02): teleop_controller is a single
+        controller instance spanning every configured arm slot (confirmed
+        by the devbox directly) -- activating it requires ALL its arms'
+        command interfaces to be free at that moment, not just the one
+        arm we're nominally switching. Per-arm independent switch_to_teleop()
+        calls (looping arm by arm, each a separate switch_controller call)
+        hit this directly: switching leader_l to teleop while
+        follower_r_forward_position_controller is still active fails with
+        "command interface 'follower_r_joint1/position' is currently
+        claimed by another controller", even though the call never
+        mentions follower_r at all -- activating the shared controller
+        implicitly needs its interfaces too. The reverse direction
+        (give-back) happens to work via a per-arm loop today, since
+        deactivating the shared controller on the FIRST arm's call already
+        frees every arm's interfaces for the rest -- but this method
+        handles both directions the same, explicit way rather than relying
+        on that asymmetry.
+
+        Uses arm[0]'s SwitchServiceClient for the actual service call
+        (any arm's client works, all point at the same controller_manager)
+        -- same "any arm's client will do" reasoning already used for the
+        shared ArmsResetterClient call below.
+        """
+        primary = self._arms[0]._switch_client
+        states = primary._get_controller_states()
+        if states is None:
+            return False
+
+        teleop_name = primary._teleop_controller
+        policy_names = [arm._switch_client._policy_controller for arm in self._arms]
+
+        if want_teleop:
+            activate = [] if states.get(teleop_name) == "active" else [teleop_name]
+            deactivate = [p for p in policy_names if states.get(p) == "active"]
+        else:
+            activate = [p for p in policy_names if states.get(p) != "active"]
+            deactivate = [] if states.get(teleop_name) != "active" else [teleop_name]
+
+        if not activate and not deactivate:
+            return True
+        return primary._call_switch(activate=activate, deactivate=deactivate)
+
     def perform_episode_reset_and_wait(
         self,
         timeout_s: float = 15.0,
@@ -245,24 +291,23 @@ class AnvilOpenArmMultiLeader(Teleoperator):
         homing sequences against the same hardware, neither of which is
         anything the resetter's API is built to support.
 
-        Both arms are switched to teleop (releasing their own
-        forward-position controllers) before that single reset call, and
-        both are switched back to policy after -- each arm's own
-        SwitchServiceClient only ever touches that one arm's controllers,
-        so doing this per-arm (unlike the resetter call) is correct and
-        necessary.
+        Both switches (to teleop before homing, back to policy after) go
+        through _combined_switch() -- a single switch_controller call
+        covering every arm's own policy controller plus the one shared
+        teleop_controller -- not independent per-arm calls. See
+        _combined_switch()'s own docstring for the real conflict this
+        avoids.
         """
         if before_homing is not None:
             before_homing()
 
         for arm in self._arms:
             arm._reset_in_progress_unsafe = True
-            if not arm._switch_client.switch_to_teleop():
-                raise RuntimeError(
-                    f"AnvilOpenArmMultiLeader: failed to switch {arm.config.ros_prefix} to "
-                    "teleop_controller before homing -- aborting before calling the real "
-                    "arms_resetter so at most one arm is left in an ambiguous state."
-                )
+        if not self._combined_switch(want_teleop=True):
+            raise RuntimeError(
+                "AnvilOpenArmMultiLeader: failed to switch to teleop_controller before "
+                "homing -- aborting before calling the real arms_resetter."
+            )
 
         if not self._arms[0]._arms_resetter.reset_and_wait(timeout_s=timeout_s):
             raise RuntimeError(
@@ -274,18 +319,10 @@ class AnvilOpenArmMultiLeader(Teleoperator):
         if after_homed is not None:
             after_homed()
 
-        ok = True
-        for arm in self._arms:
-            if not arm._switch_client.switch_to_policy():
-                ok = False
-                arm._node.get_logger().error(
-                    f"AnvilOpenArmMultiLeader: homing succeeded but re-establishing the "
-                    f"policy-controlled baseline for {arm.config.ros_prefix} failed."
-                )
-        if not ok:
+        if not self._combined_switch(want_teleop=False):
             raise RuntimeError(
-                "AnvilOpenArmMultiLeader: homing succeeded but at least one arm failed to "
-                "switch back to policy control afterward -- see the per-arm error(s) above."
+                "AnvilOpenArmMultiLeader: homing succeeded but switching back to "
+                "policy control afterward failed -- see the error above."
             )
 
         for arm in self._arms:
