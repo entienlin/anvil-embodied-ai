@@ -71,7 +71,15 @@ env:
         control_frequency: 10.0
         max_position_delta: 0.08
         max_command_step_rad: 0.06
-        obs_timeout_s: 2.0
+        # Bumped from 2.0 (connect()'s real deadline is this * 3 = 15s, not
+        # 6s) -- 2026-10-02: a real connect() attempt timed out waiting for
+        # a complete observation across 3 cameras + joint_states at once
+        # (the 6s default was sized for single-arm's 1-camera case) even
+        # though all 4 topics were independently confirmed publishing at
+        # healthy rates moments later -- looked like DDS discovery/first-
+        # frame timing for 3 simultaneous camera topics on a cold connect,
+        # not a dead topic. follower_l keeps the original 2.0 (1 camera).
+        obs_timeout_s: 5.0
 
   teleop:
     type: anvil_openarm_multi_leader

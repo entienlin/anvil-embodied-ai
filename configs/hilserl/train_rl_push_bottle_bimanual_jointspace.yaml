@@ -108,7 +108,12 @@ env:
         control_frequency: 10.0
         max_position_delta: 0.08
         max_command_step_rad: 0.06
-        obs_timeout_s: 2.0
+        # See env_push_bottle_bimanual_jointspace.yaml's identical comment --
+        # connect()'s real deadline is this * 3 (15s); 2.0 (6s) wasn't
+        # always enough for 3 cameras + joint_states to all arrive on a
+        # cold connect, even though all 4 topics publish at healthy rates
+        # once discovered. follower_l keeps 2.0 (1 camera).
+        obs_timeout_s: 5.0
 
   teleop:
     type: anvil_openarm_multi_leader
