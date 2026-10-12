@@ -102,6 +102,19 @@ env:
         max_position_delta: 0.08
         max_command_step_rad: 0.06
         obs_timeout_s: 2.0
+        # Widened from the default 10, 2026-10-12: real-hardware trace data
+        # showed follower_l's "liveness watchdog tripped" fault correlates
+        # with the policy's coarse-to-fine command-magnitude transition
+        # (step-aligned across repeated attempts, not time-aligned),
+        # suspected to be a dead-band in the closed OpenArm_v10HW plugin /
+        # Damiao firmware (no configurable deadband param exists anywhere
+        # in the exposed ros2_control surface -- checked exhaustively).
+        # If the condition is transient, a wider window gives the policy's
+        # own trajectory room to move past it before this safety net kills
+        # the session -- see robot_anvil_openarm.py's _LIVENESS_WINDOW_SIZE
+        # comment for the full history/reasoning. Not a fix for the
+        # underlying freeze, just a less-trigger-happy safety margin.
+        liveness_window_size: 40
       - ros_prefix: follower_r
         joint_state_topic: /joint_states
         command_topic: /follower_r_forward_position_controller/commands
@@ -113,6 +126,9 @@ env:
         control_frequency: 10.0
         max_position_delta: 0.08
         max_command_step_rad: 0.06
+        # Same widening as follower_l above -- this fault has hit both
+        # arms at different times across this project's history.
+        liveness_window_size: 40
         # See env_push_bottle_bimanual_jointspace.yaml's identical comment --
         # connect()'s real deadline is this * 3 (15s); 2.0 (6s) wasn't
         # always enough for 3 cameras + joint_states to all arrive on a
@@ -222,6 +238,13 @@ output_dir: outputs/hilserl_push_bottle_bimanual_jointspace
 job_name: hilserl_push_bottle_bimanual_jointspace
 seed: 42
 batch_size: 256
-save_freq: 250
+# 100, not the stock 250 -- real sessions on this rig have repeatedly been
+# cut short by hardware faults well under 250 steps (see the HIL-SERL
+# bimanual plan's "follower dead" investigation), so a coarser interval
+# risked losing most or all of a session's progress. Checkpoints are
+# fully resumable (policy/critic/optimizer state + replay buffers, see
+# scripts/run_hilserl_bimanual.sh's --resume flag), so saving more often
+# only costs disk, not correctness. Override via --save-freq if needed.
+save_freq: 100
 wandb:
   enable: false

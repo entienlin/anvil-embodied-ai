@@ -59,6 +59,13 @@ class AnvilOpenArmFollowerConfig(RobotConfig):
     # j6 wobble, 2026-09-21 trace). None disables.
     max_command_step_rad: float | None = 0.03
     obs_timeout_s: float = 2.0
+    # Liveness watchdog window (ticks) -- see AnvilOpenArmFollower's class
+    # docstring comment on _LIVENESS_WINDOW_SIZE for the default's original
+    # reasoning and 2026-10-12's revision of it. Override per-arm via this
+    # config field (e.g. a wider value for an arm/task combination known to
+    # pass through a real, transient small-delta phase) rather than editing
+    # the class constant, which stays as the dataclass default.
+    liveness_window_size: int = 10
 
 
 class _BusShim:
@@ -85,12 +92,34 @@ class AnvilOpenArmFollower(Robot):
 
     # Liveness watchdog tuning -- see the docstring on
     # self._liveness_observed_window in __init__ for why this exists.
-    # Window size ~1s at this task's 10Hz control_frequency: every real
-    # fault occurrence so far has been near-instantaneous (all affected
-    # joints drop within ~2-7ms), so 1s of sustained "commanded but not
-    # moving" is a comfortable margin above any normal settle/latency
-    # jitter while still catching a real fault within one second of it
-    # happening, not many seconds later.
+    # This is the DEFAULT, overridable per-arm via
+    # AnvilOpenArmFollowerConfig.liveness_window_size (actual runtime value
+    # lives in self._liveness_window_size, set from config in __init__ --
+    # this class constant stays fixed at the original default so existing
+    # tests that read it directly keep meaning the same thing).
+    #
+    # ORIGINAL reasoning (window ~1s at 10Hz): every real fault occurrence
+    # at the time looked near-instantaneous (affected joints dropping
+    # within ~2-7ms), so 1s of sustained "commanded but not moving" seemed
+    # like a comfortable margin above normal jitter.
+    #
+    # REVISED, 2026-10-12: real-hardware trace data (devbox command-vs-
+    # actual capture, bimanual push-bottle, follower_l) showed the freeze
+    # is not instantaneous at all -- it begins exactly when the policy's
+    # commanded deltas drop from a coarse sweep (~0.04-0.06 rad/step) into
+    # a fine/contact-seeking correction phase (<0.002 rad/step), step-
+    # aligned across repeated deterministic-policy attempts, not time-
+    # aligned. Root cause suspected to be a magnitude-dependent dead-band
+    # in the closed OpenArm_v10HW plugin or the Damiao motor firmware
+    # itself (confirmed: no configurable deadband/threshold parameter
+    # exists anywhere in the exposed ros2_control surface for this
+    # pipeline -- checked exhaustively on the devbox side). If that's
+    # right, the condition is plausibly transient: once the policy's own
+    # trajectory moves back into larger deltas, the same joint may start
+    # tracking again on its own. A 10-tick (~1-2s) window gives it no time
+    # to do that before this watchdog kills the whole session. Per-arm
+    # config override (not changed here) widens this for the affected
+    # task/arm instead of removing the safety net outright.
     _LIVENESS_WINDOW_SIZE = 10
     # rad; a commanded delta below this is "holding still on purpose",
     # not a real move attempt, and shouldn't count toward the streak.
@@ -164,7 +193,8 @@ class AnvilOpenArmFollower(Robot):
         # sustained period with zero observed response -- turning a
         # silent, undetectable failure into a loud one, independent of
         # whatever the underlying root cause turns out to be.
-        self._liveness_observed_window: deque = deque(maxlen=self._LIVENESS_WINDOW_SIZE)
+        self._liveness_window_size = config.liveness_window_size
+        self._liveness_observed_window: deque = deque(maxlen=self._liveness_window_size)
         self._liveness_commanded_streak = 0
 
         # Real hardware finding: reset()'s blocking sleep (already patched
@@ -568,8 +598,8 @@ class AnvilOpenArmFollower(Robot):
         self._liveness_observed_window.append(observed_rad)
 
         if (
-            self._liveness_commanded_streak < self._LIVENESS_WINDOW_SIZE
-            or len(self._liveness_observed_window) < self._LIVENESS_WINDOW_SIZE
+            self._liveness_commanded_streak < self._liveness_window_size
+            or len(self._liveness_observed_window) < self._liveness_window_size
         ):
             return
 
@@ -580,7 +610,7 @@ class AnvilOpenArmFollower(Robot):
                 f"AnvilOpenArmFollower({self.config.ros_prefix}): liveness watchdog "
                 f"tripped -- commanded real movement "
                 f"(>{self._LIVENESS_COMMAND_THRESHOLD_RAD} rad delta) "
-                f"for {self._LIVENESS_WINDOW_SIZE} consecutive ticks but observed "
+                f"for {self._liveness_window_size} consecutive ticks but observed "
                 f"joint position only moved {observed_range:.5f} rad over that same "
                 f"window (threshold {self._LIVENESS_STILL_THRESHOLD_RAD} rad). The "
                 f"{self.config.ros_prefix} arm appears unresponsive -- see the "

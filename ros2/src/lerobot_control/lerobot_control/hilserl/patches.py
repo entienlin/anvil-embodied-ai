@@ -993,21 +993,92 @@ def patch_sac_actor_warmup() -> None:
     temperature) were first added ("do only if A+B aren't enough") --
     today's session is the first real evidence they aren't.
 
-    Fix: let the critic train against real transitions for
+    Fix (ORIGINAL design, superseded below 2026-10-12 -- kept for history):
+    let the critic train against real transitions for
     HILSERL_ACTOR_WARMUP_STEPS actor-update opportunities before the actor
-    optimizer is allowed to take its first step. compute_loss_actor/
-    .backward() still run every time (cheap, keeps the graph/optimizer
-    state exercised) -- only optimizers["actor"].step() is skipped, so no
-    autograd/requires_grad surgery and no risk of the same
-    "loss becomes non-differentiable" crash class the temperature fix had
-    to avoid. Critic/discrete_critic/temperature optimizers are completely
-    untouched.
+    optimizer is allowed to take its first step, by skipping
+    optimizers["actor"].step() entirely for that many calls.
+    Critic/discrete_critic/temperature optimizers are completely untouched.
 
     Opt-in via HILSERL_ACTOR_WARMUP_STEPS (default 0 = off, i.e. today's
     exact prior behavior) rather than always-on -- this is a new, only
     offline-reasoned idea, never validated even in a fake-hardware run
     yet, and every other lever pulled during real-RL sessions in this
     project has been introduced as an explicit opt-in first.
+
+    REAL GAP FOUND AND CLOSED, 2026-10-08 (bimanual push-bottle, two
+    reproductions from a clean, just-reverted checkpoint): episode 1 was
+    confident/BC-level (commanded delta from the real current state
+    ~10-24 deg/step, measured directly from saved actor_trajectories
+    .npz files); episode 2, immediately after only ~100 real optimization
+    steps (well under HILSERL_ACTOR_WARMUP_STEPS=200), collapsed to
+    near-zero commanded deltas (~0.4-1.0 deg/step) -- essentially a
+    frozen/no-op policy -- despite the actor optimizer's own .step()
+    being correctly skipped the whole time (confirmed: 100 <= 200).
+
+    Root cause, confirmed directly from modeling_sac.py/learner.py
+    source: SACConfig.shared_encoder defaults to True (not overridden by
+    this task's config), and make_optimizers_and_scheduler()'s OWN
+    docstring says exactly this -- "if the encoder is shared, its
+    parameters are excluded from the actor's optimization process" --
+    excluded from optimizer_actor, but NOT excluded from optimizer_critic
+    (`torch.optim.Adam(params=policy.critic_ensemble.parameters(), ...)`,
+    and critic_ensemble owns/wraps the SAME encoder object as the actor
+    when shared -- policy.encoder_critic is policy.actor.encoder).
+    optimizers["critic"].step() is NEVER warmup-gated (runs from
+    optimization_step 1) -- so the shared representation the actor's
+    forward pass depends on was drifting, unconstrained, under a
+    critic that had barely any real calibration yet, the entire time
+    the actor's OWN head was correctly frozen. Freezing only
+    optimizers["actor"] protects half the pipeline that actually
+    determines the actor's output; the other half (the shared encoder)
+    was never covered at all.
+
+    Fix: when policy.shared_encoder is True, ALSO toggle requires_grad on
+    policy.encoder_critic's parameters in lockstep with the same warmup
+    counter -- frozen (no critic-driven drift) for the first
+    HILSERL_ACTOR_WARMUP_STEPS calls, unfrozen at the exact same moment
+    the ramp below completes. Safe (no "does not require grad" crash
+    risk, unlike the temperature-loss fix): these are LEAF parameter
+    tensors, not a whole loss graph -- loss_critic still has other
+    (critic-head) parameters requiring grad, so .backward() still
+    succeeds normally; the frozen encoder params simply never accumulate
+    a .grad, and Adam silently skips params with grad=None.
+
+    SECOND REAL GAP FOUND AND CLOSED, 2026-10-12 (same task, same
+    checkpoint lineage, AFTER the shared-encoder fix above was already
+    active and confirmed): resumed from 4200 with HILSERL_ACTOR_WARMUP_
+    STEPS=200; episodes 1-2 stayed confident, episode 3 collapsed to
+    near-zero commanded deltas again -- and checkpoint-timestamp
+    cross-referencing placed that collapse within seconds of
+    checkpoint 4400, i.e. almost exactly the moment the ORIGINAL
+    skip-based warmup would have ended (resumed at 4200, warmup=200).
+    Confirmed directly from torch's own Adam source
+    (torch/optim/adam.py): `step_size = lr / (1 - beta1**step)` --
+    LARGEST at step=1, shrinking toward the nominal `lr` as `step`
+    grows. Skipping optimizers["actor"].step() entirely for the whole
+    warm-up window means Adam's own internal step counter for every
+    actor parameter stays pinned at 0 the ENTIRE time, no matter how
+    large HILSERL_ACTOR_WARMUP_STEPS is set -- so the first unskipped
+    call was always Adam's maximally-aggressive cold-start step, not a
+    calibrated one. Raising the warmup_steps value alone cannot fix
+    this -- it only delays WHEN the cold-start spike happens, matching
+    exactly what was observed (immediate collapse before the shared-
+    encoder fix; collapse delayed to right after the warm-up boundary
+    once that leak was closed).
+
+    Fix: replace the skip with a linear learning-rate RAMP (near-zero
+    -> base_lr over HILSERL_ACTOR_WARMUP_STEPS calls), calling
+    orig_step() on EVERY call rather than skipping it. Adam's internal
+    step counter and moment estimates now build up normally against
+    real (just heavily down-scaled) gradients throughout the ramp, so
+    bias-correction has already mostly washed out by the time the ramp
+    reaches 1.0 -- there is no instant full-LR step at any point, cold
+    or otherwise. This is standard LR warmup, not a new/novel
+    mechanism. Not yet validated on real hardware -- the 2026-10-08
+    shared-encoder fix took one real-hardware attempt to find its own
+    edge case; treat this the same way (opt-in, same env var, watch
+    the next real session closely).
     """
     try:
         import lerobot.rl.learner as learner_mod
@@ -1031,17 +1102,61 @@ def patch_sac_actor_warmup() -> None:
         if actor_opt is not None:
             orig_step = actor_opt.step
             state = {"n": 0}
+            base_lrs = [g["lr"] for g in actor_opt.param_groups]
+
+            shared_encoder_params = None
+            if getattr(policy, "shared_encoder", False):
+                shared_encoder_params = list(policy.encoder_critic.parameters())
+                for p in shared_encoder_params:
+                    p.requires_grad_(False)
+                print(
+                    f"[LEARNER-DBG] actor warm-up: ALSO freezing {len(shared_encoder_params)} "
+                    "shared-encoder parameters for the warm-up window -- optimizers['critic'] "
+                    "would otherwise keep updating them every step regardless of the actor "
+                    "optimizer freeze (see patch_sac_actor_warmup()'s docstring).",
+                    flush=True,
+                )
 
             def _step(*a, **kw):
                 state["n"] += 1
                 if state["n"] <= warmup_steps:
+                    # Linear LR ramp (near-zero -> base_lr), NOT a skipped
+                    # .step() call -- confirmed, 2026-10-12, via direct read
+                    # of torch's own Adam source: step_size = lr /
+                    # (1 - beta1**t), which is LARGEST at t=1 and shrinks as
+                    # t grows. The original "skip orig_step() entirely for N
+                    # calls" design left Adam's internal step counter pinned
+                    # at 0 for the whole warm-up window, REGARDLESS of how
+                    # large N was -- so the first unskipped call was always
+                    # Adam's maximally-aggressive cold-start step, not a
+                    # calibrated one. Confirmed on real hardware: with
+                    # warm-up=200 and the shared-encoder leak already fixed,
+                    # the policy still collapsed almost exactly at the
+                    # warm-up boundary (episode 3, right after checkpoint
+                    # 4400 -- 200 real optimization steps after resuming
+                    # from 4200) -- raising warmup_steps alone would only
+                    # have delayed this, not prevented it, since Adam's
+                    # counter never moves during a skip either way. Calling
+                    # orig_step() every time (never skipping) lets Adam's
+                    # own step counter and moment estimates build up
+                    # normally on real, just heavily down-scaled, gradients,
+                    # so bias-correction has already mostly washed out by
+                    # the time the ramp reaches 1.0 -- no sudden transition.
+                    ramp = state["n"] / warmup_steps
+                    for group, base_lr in zip(actor_opt.param_groups, base_lrs):
+                        group["lr"] = base_lr * ramp
                     if state["n"] == warmup_steps:
+                        for group, base_lr in zip(actor_opt.param_groups, base_lrs):
+                            group["lr"] = base_lr
+                        if shared_encoder_params is not None:
+                            for p in shared_encoder_params:
+                                p.requires_grad_(True)
                         print(
-                            f"[LEARNER-DBG] actor warm-up done after {warmup_steps} "
-                            "critic-only updates -- actor optimizer now stepping.",
+                            f"[LEARNER-DBG] actor warm-up ramp complete after {warmup_steps} "
+                            f"steps -- actor LR restored to {base_lrs}, shared-encoder "
+                            "parameters (if any) unfrozen too.",
                             flush=True,
                         )
-                    return None  # critic-only warm-up: skip this actor update
                 return orig_step(*a, **kw)
 
             actor_opt.step = _step
@@ -1294,6 +1409,7 @@ def apply_all_patches() -> None:
     Call this from every entrypoint that reaches that pipeline, not just
     hilserl_gym_manipulator's own.
     """
+    patch_logging_includes_tracebacks()
     patch_map_delta_action_for_gripperless_robots()
     patch_ee_bounds_and_safety_to_clamp_not_crash()
     patch_inverse_kinematics_to_always_reseed_from_real_joints()
@@ -1304,6 +1420,10 @@ def apply_all_patches() -> None:
     patch_train_pipeline_config_validate_for_optional_dataset()
     patch_learner_progress_visibility()
     patch_learner_stop_at_online_steps()
+    patch_learner_resume_offline_buffer_from_source()
+    patch_learner_resume_online_buffer_tolerates_broken_snapshot()
+    patch_learner_resume_preserves_cli_online_steps_and_save_freq()
+    patch_learner_pauses_training_when_actor_idle()
     patch_sac_deterministic_inference()
     patch_sac_loads_action_bounds_on_from_pretrained()
     patch_sac_normalizes_replay_buffer_actions_for_critic_loss()
@@ -1345,6 +1465,124 @@ def patch_learner_stop_at_online_steps() -> None:
         return result
 
     learner_mod.save_training_checkpoint = _save
+
+
+def patch_learner_resume_offline_buffer_from_source() -> None:
+    """On --resume=true, initialize_offline_replay_buffer() tries to reload
+    the offline buffer from the snapshot save_training_checkpoint() wrote to
+    <output_dir>/dataset_offline, via a raw LeRobotDataset(repo_id=...,
+    root=dataset_offline_path) construction. That snapshot's meta/ directory
+    is missing meta/episodes/ (confirmed directly: present in the real
+    source dataset at data/datasets/push_bottle_bimanual_demos_combined/meta/
+    episodes/, absent from the saved dataset_offline snapshot) -- a genuine
+    save/load mismatch in lerobot's own checkpoint code, not anything in our
+    patches. LeRobotDatasetMetadata._load_metadata() -> load_episodes() then
+    raises FileNotFoundError, which LeRobotDatasetMetadata.__init__ catches
+    and silently falls back to a Hub download using cfg.dataset.repo_id --
+    a cosmetic label that has never actually been pushed to the real HF Hub
+    in this project, so that fallback hard-crashes with a 401
+    RepositoryNotFoundError (hit directly, 2026-10-07, blocking every
+    --resume actor connection: the learner's gRPC server never finishes
+    starting).
+
+    The offline buffer is the static original demo set -- it never changes
+    across a session, so there is nothing to actually "resume" about it.
+    Fix: on resume, build it the exact same way a fresh run already does
+    successfully (make_dataset(cfg), confirmed by every prior successful
+    session this project has run) instead of trying to reload the broken
+    snapshot. The ONLINE buffer's own resume path (initialize_replay_buffer(),
+    reloading <output_dir>/dataset) hits the exact same bug -- confirmed
+    directly, 2026-10-07, same FileNotFoundError -> 401 crash, just on the
+    online dataset snapshot instead of the offline one. See
+    patch_learner_resume_online_buffer_tolerates_broken_snapshot() below for
+    that one -- it needs a different fix, since there is no equivalent
+    "real source" to fall back to for genuinely-accumulated online data."""
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_offline_resume_patched", False):
+        return
+    learner_mod._anvil_offline_resume_patched = True
+
+    def _initialize_offline_replay_buffer(cfg, device, storage_device):
+        import logging
+
+        from lerobot.rl.buffer import ReplayBuffer
+
+        logging.info("make_dataset offline buffer (resume-safe: source dataset, not the saved snapshot)")
+        offline_dataset = learner_mod.make_dataset(cfg)
+        return ReplayBuffer.from_lerobot_dataset(
+            lerobot_dataset=offline_dataset,
+            capacity=cfg.policy.offline_buffer_capacity,
+            device=device,
+            state_keys=cfg.policy.input_features.keys(),
+            storage_device=storage_device,
+            optimize_memory=True,
+        )
+
+    learner_mod.initialize_offline_replay_buffer = _initialize_offline_replay_buffer
+
+
+def patch_learner_resume_online_buffer_tolerates_broken_snapshot() -> None:
+    """Same underlying bug as patch_learner_resume_offline_buffer_from_source()
+    (see its docstring) -- LeRobotDataset(repo_id=cfg.dataset.repo_id,
+    root=<output_dir>/dataset) hits the identical FileNotFoundError ->
+    broken-Hub-fallback -> 401 crash, confirmed directly 2026-10-07, blocking
+    every --resume learner startup that had ever accumulated online data.
+
+    Unlike the offline buffer, there is no equivalent real source to fall
+    back to here -- the online buffer holds genuinely-accumulated live
+    transitions that exist nowhere else. Reconstructing the missing
+    meta/episodes/ parquet ourselves was considered and rejected: it would
+    require inferring episode boundaries from the raw frame data with no
+    way to verify correctness, risking silently-wrong training data, which
+    is a worse failure mode than losing some online history outright.
+
+    Fix: try the real reload; if it fails for ANY reason (this bug, or
+    anything else), fall back to a fresh empty ReplayBuffer -- the exact
+    same construction the non-resume branch already uses. This only
+    affects the online buffer's CONTENTS. The thing that actually matters
+    across a resume -- policy/critic/optimizer state and the step counter
+    -- comes from load_training_state()'s own, completely separate path
+    (raw safetensors/torch files, no LeRobotDataset involved at all), so
+    it is unaffected either way: this patch can only cost some accumulated
+    online sample efficiency, never the trained policy itself."""
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_online_resume_patched", False):
+        return
+    learner_mod._anvil_online_resume_patched = True
+
+    orig_initialize = learner_mod.initialize_replay_buffer
+
+    def _initialize_replay_buffer(cfg, device, storage_device):
+        import logging
+
+        from lerobot.rl.buffer import ReplayBuffer
+
+        if not cfg.resume:
+            return orig_initialize(cfg, device, storage_device)
+        try:
+            return orig_initialize(cfg, device, storage_device)
+        except Exception as e:  # noqa: BLE001 -- see docstring: fall back, never crash
+            logging.warning(
+                f"[LEARNER] Could not reload the saved online replay buffer on resume "
+                f"({e!r}) -- starting the online buffer empty instead. Policy/critic/"
+                f"optimizer state is unaffected (loaded separately); only accumulated "
+                f"online sample history is lost for this resume."
+            )
+            return ReplayBuffer(
+                capacity=cfg.policy.online_buffer_capacity,
+                device=device,
+                state_keys=cfg.policy.input_features.keys(),
+                storage_device=storage_device,
+                optimize_memory=True,
+            )
+
+    learner_mod.initialize_replay_buffer = _initialize_replay_buffer
 
 
 def save_actor_trajectory(transitions) -> str | None:
@@ -1567,3 +1805,222 @@ def patch_train_pipeline_config_validate_for_optional_dataset() -> None:
 
     TrainPipelineConfig.validate = _patched_validate
     TrainPipelineConfig._anvil_optional_dataset_validate_patch_applied = True
+
+
+def patch_learner_resume_preserves_cli_online_steps_and_save_freq() -> None:
+    """handle_resume_logic() (lerobot/rl/learner.py) unconditionally REPLACES
+    the whole cfg object with TrainRLServerPipelineConfig.from_pretrained()
+    of the checkpoint's own saved train_config.json -- i.e. whatever
+    --policy.online_steps/--save_freq this specific invocation was launched
+    with on the CLI is silently discarded, replaced by whatever those
+    fields happened to be the very FIRST time this run was ever started
+    fresh (confirmed directly, 2026-10-07: a run's checkpoints kept landing
+    on multiples of 250, the old save_freq default, despite --save-freq 100
+    being passed on every resumed launch since).
+
+    This matters beyond cosmetics: it's also what let the "learner trains
+    forever" safety patch (patch_learner_stop_at_online_steps(), which
+    fires on optimization_step == online_steps) go silently inert across a
+    resume -- the stale online_steps value is already behind the resumed
+    step counter the instant training resumes, so that equality can never
+    hold again. This is a direct contributor to the runaway-to-4000+-steps
+    incident from earlier today (see patch_learner_resume_online_buffer_
+    tolerates_broken_snapshot()'s docstring for the rest of that story).
+
+    Fix: capture THIS invocation's actually-requested online_steps/
+    save_freq before calling the original (unconditionally, so the
+    non-resume FileExistsError-prevention branch is untouched), then
+    re-apply them onto whatever handle_resume_logic() returns -- only when
+    this call was actually a resume (a fresh run's own online_steps/
+    save_freq were never going to be touched by this function anyway).
+    Everything ELSE handle_resume_logic() restores from the checkpoint
+    (pretrained_path, env/robot/policy architecture, dataset paths, ...)
+    is left alone -- only these two fields are meant to be a per-invocation
+    choice rather than a frozen historical artifact."""
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_resume_cli_steps_patched", False):
+        return
+    learner_mod._anvil_resume_cli_steps_patched = True
+
+    orig_handle_resume_logic = learner_mod.handle_resume_logic
+
+    def _handle_resume_logic(cfg):
+        was_resuming = cfg.resume
+        requested_online_steps = cfg.policy.online_steps
+        requested_save_freq = cfg.save_freq
+        new_cfg = orig_handle_resume_logic(cfg)
+        if was_resuming:
+            new_cfg.policy.online_steps = requested_online_steps
+            new_cfg.save_freq = requested_save_freq
+        return new_cfg
+
+    learner_mod.handle_resume_logic = _handle_resume_logic
+
+
+def patch_learner_pauses_training_when_actor_idle() -> None:
+    """lerobot's learner main loop (`while True` in add_actor_information_and_train())
+    never pauses training based on whether the ACTOR is still around -- it
+    only gates on `len(replay_buffer) < online_step_before_learning`
+    (lerobot/rl/learner.py), a one-way check that's satisfied forever once
+    enough transitions have EVER arrived. Confirmed directly, 2026-10-07:
+    one real completed episode (47 transitions, from an early session) was
+    enough to let the learner train for 550+ further optimization steps
+    across three SUBSEQUENT actor sessions that each crashed before
+    completing a single episode -- i.e. that contributed nothing new. The
+    policy kept changing the whole time, grounded in nothing but one old
+    episode plus the fixed offline set, repeatedly, while real sessions
+    kept failing faster and more consistently each time (same deterministic
+    policy + same post-rehome starting state -> an increasingly-overfit
+    policy reproducing roughly the same trajectory each attempt is a
+    plausible contributor, though not a proven root cause of the hardware
+    fault itself).
+
+    Fix: wrap whatever initialize_replay_buffer() currently returns (so
+    this composes correctly regardless of patch_learner_resume_online_
+    buffer_tolerates_broken_snapshot() -- must be registered AFTER that one
+    in apply_all_patches()) in a thin proxy that tracks the wall-clock time
+    of the last .add() call and makes __len__ report 0 (not "pause" --
+    genuinely report empty) whenever nothing has been added in the last
+    STALE_AFTER_S seconds. The existing `len(replay_buffer) <
+    online_step_before_learning: continue` check then does the actual
+    pausing for free, with zero changes to the loop itself: real data
+    already in the buffer is never discarded, sampling/training just can't
+    proceed on it until something fresh arrives again.
+
+    STALE_AFTER_S=90 is deliberately generous relative to this task's own
+    per-episode timing (processor.reset.control_time_s=20s plus homing/
+    intervention overhead, confirmed in the bimanual task config) -- long
+    enough that normal multi-episode operation, where fresh transitions
+    only arrive at EPISODE boundaries (confirmed separately: actor.py only
+    calls push_transitions_to_transport_queue() inside `if done or
+    truncated:`, never per-tick), is never falsely paused, while still
+    catching real multi-minute gaps between actor attempts (waiting on a
+    devbox re-home, reading a message, etc.)."""
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_idle_pause_patched", False):
+        return
+    learner_mod._anvil_idle_pause_patched = True
+
+    import time as _time
+
+    STALE_AFTER_S = 90.0
+
+    class _StalenessAwareReplayBuffer:
+        def __init__(self, real):
+            self._anvil_real = real
+            # Deliberately already-stale, not _time.time() -- confirmed as a
+            # real bug 2026-10-08: initializing to "now" gave every fresh
+            # learner start/resume up to STALE_AFTER_S seconds of training
+            # on the just-loaded (potentially hours-old) buffer before
+            # staleness ever kicked in, even with zero actor connected --
+            # exactly the pathology this patch exists to prevent, just
+            # triggered by a restart instead of a long idle gap. Three
+            # learner restarts in one morning (while iterating on this
+            # launcher script) each bought ~1-2 real minutes of unprotected
+            # retraining on 6+ hour old data with no fresh correction,
+            # visibly degrading the policy. "Nothing has been added in the
+            # last STALE_AFTER_S seconds" is literally true the instant this
+            # object is constructed -- no .add() has happened yet in this
+            # process's lifetime -- so __len__ must report 0 from the very
+            # first call, not just after the first real idle period.
+            self._anvil_last_add = _time.time() - STALE_AFTER_S - 1.0
+
+        def add(self, *args, **kwargs):
+            self._anvil_last_add = _time.time()
+            return self._anvil_real.add(*args, **kwargs)
+
+        def __len__(self):
+            if _time.time() - self._anvil_last_add > STALE_AFTER_S:
+                return 0
+            return len(self._anvil_real)
+
+        def __getattr__(self, name):
+            return getattr(self._anvil_real, name)
+
+    orig_initialize_replay_buffer = learner_mod.initialize_replay_buffer
+
+    def _initialize_replay_buffer(cfg, device, storage_device):
+        real_buffer = orig_initialize_replay_buffer(cfg, device, storage_device)
+        return _StalenessAwareReplayBuffer(real_buffer)
+
+    learner_mod.initialize_replay_buffer = _initialize_replay_buffer
+
+
+def patch_logging_includes_tracebacks() -> None:
+    """lerobot's init_logging() (lerobot/utils/utils.py) installs a
+    custom_format() that only ever calls record.getMessage() -- it never
+    renders record.exc_info, so any logging.exception()/log(..., exc_info=True)
+    call silently loses its traceback, even though the LogRecord carries one.
+
+    This is the reason two separate real, session-ending actor crashes
+    (2026-10-08, global steps ~107 and ~289, both logged as a bare
+    "ERROR ... _channel.py:284 Exception iterating requests!" with no
+    further detail) could not be root-caused from the log alone: grpc's own
+    _consume_request_iterator() (grpc/_channel.py) wraps the request
+    generator in `except Exception: ... _LOGGER.exception(details)` --
+    logging.exception() always attaches the real underlying exception (the
+    one that actually broke mid-stream, e.g. a tensor pickling/serialization
+    error, a CUDA error, a broken pipe) via exc_info -- but init_logging()'s
+    formatter throws that traceback away before it ever reaches the log
+    file. Confirmed directly: neither occurrence had any traceback text in
+    the log, despite grpc's own code unconditionally calling the
+    exc_info-attaching logging method right before raising.
+
+    Fix: wrap init_logging itself (in every module that already imported it
+    by name -- lerobot.rl.actor and lerobot.rl.learner both do `from
+    lerobot.utils.utils import init_logging` at module load time, before
+    apply_all_patches() ever runs, so patching lerobot.utils.utils.init_logging
+    alone would not affect their already-bound references) so that, after
+    the real init_logging() finishes (re)installing handlers, every
+    handler's formatter also appends the traceback when a record carries
+    exc_info -- exactly what Python's own default logging.Formatter does,
+    without changing the existing single-line format for the overwhelming
+    majority of records that have none. Each handler's formatter is wrapped
+    only once (guarded per-formatter-instance, not just per-module), since
+    init_logging() clears and recreates handlers on every call (every forked
+    actor subprocess calls it again with its own log file)."""
+    try:
+        import lerobot.utils.utils as utils_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(utils_mod, "_anvil_logging_tracebacks_patched", False):
+        return
+    utils_mod._anvil_logging_tracebacks_patched = True
+
+    import logging as _logging
+
+    orig_init_logging = utils_mod.init_logging
+    _tb_formatter = _logging.Formatter()
+
+    def _init_logging_with_tracebacks(*args, **kwargs):
+        orig_init_logging(*args, **kwargs)
+        for handler in _logging.getLogger().handlers:
+            fmt = handler.formatter
+            if fmt is None or getattr(fmt, "_anvil_tb_wrapped", False):
+                continue
+            base_format = fmt.format
+
+            def _format(record, _base=base_format):
+                text = _base(record)
+                if record.exc_info:
+                    text = f"{text}\n{_tb_formatter.formatException(record.exc_info)}"
+                return text
+
+            fmt.format = _format
+            fmt._anvil_tb_wrapped = True
+
+    utils_mod.init_logging = _init_logging_with_tracebacks
+
+    for module_name in ("lerobot.rl.actor", "lerobot.rl.learner"):
+        try:
+            consumer_mod = __import__(module_name, fromlist=["init_logging"])
+        except Exception:  # noqa: BLE001
+            continue
+        if getattr(consumer_mod, "init_logging", None) is orig_init_logging:
+            consumer_mod.init_logging = _init_logging_with_tracebacks
