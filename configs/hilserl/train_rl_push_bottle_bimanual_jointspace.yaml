@@ -7,8 +7,15 @@
 # same `processor.inverse_kinematics: null` escape hatch (see this
 # project's bimanual task notes -- namespacing the stock EE-delta/IK chain
 # for two independent end-effectors would be real, nontrivial new code
-# this design deliberately avoids by never engaging it at all), just
-# 2 arms (14 joints total, no gripper) and 4 cameras instead of 1+1.
+# this design deliberately avoids by never engaging it at all), 2 arms
+# (14 joints total) and 4 cameras instead of 1+1, PLUS (2026-10-12) one
+# real gripper dimension on follower_r/leader_r only -- 15-dim state/
+# action total. See env_push_bottle_bimanual_jointspace.yaml's header for
+# why only the right arm gets a gripper (this task's eventual
+# pick-and-place goal only has the right arm grasping anything) and
+# robot_anvil_openarm.py's AnvilOpenArmFollowerConfig.use_gripper for the
+# implementation. The gripper's own value is RAW METERS (finger_joint1 is
+# prismatic, 0.0-0.05m), not degrees like the other 14 dimensions.
 #
 # robot.type/teleop.type here are the NEW composite classes
 # (AnvilOpenArmMultiFollower/AnvilOpenArmMultiLeader,
@@ -47,15 +54,28 @@
 # actor/learner -- identical usage pattern to train_rl_push_bottle_jointspace.yaml,
 # just pointed at this config instead.
 #
-# dataset: now points at the first 10 real bimanual demos (2026-10-02,
-# env_push_bottle_bimanual_jointspace.yaml recording sessions -- two
-# 5-episode batches merged via lerobot.datasets.dataset_tools.merge_datasets()
-# into one combined dataset, episode_index 0-9, 724 frames total, all
-# successful). policy.pretrained_path is intentionally absent for the
-# first BC pretrain run (produces a fresh checkpoint via BC_OUT) -- add it
-# back, mirroring train_rl_push_bottle_jointspace.yaml's own comment, once
-# a checkpoint exists and this config is used for live actor/learner
-# instead of BC pretraining.
+# dataset/policy.pretrained_path, 2026-10-12 GRIPPER SCHEMA CHANGE:
+# env.features.state/joint_action above are now 15-dim (14 joints + 1
+# real gripper, follower_r/leader_r only -- see this file's header). The
+# dataset this config USED to point at (the first 10 real bimanual demos,
+# 2026-10-02, 724 frames, all successful, merged via
+# lerobot.datasets.dataset_tools.merge_datasets()) and the bc_bimanual_v1
+# checkpoint it produced are BOTH 14-dim -- recorded/trained before the
+# gripper existed in this schema at all. Neither is compatible with this
+# config anymore (a 14-dim dataset's "action"/"observation.state" columns
+# will not match a 15-dim policy; SACPolicy.from_pretrained() would load a
+# 14-dim actor head into a 15-dim config). Both are therefore deliberately
+# LEFT UNSET below rather than pointed at stale, incompatible artifacts:
+#   1. Collect a FRESH set of demos against
+#      env_push_bottle_bimanual_jointspace.yaml (now also 15-dim, gripper
+#      wired in) -- needs a human on the real rig, not done yet.
+#   2. Point `dataset:` below at that new recording.
+#   3. Run a fresh BC pretrain (bc_pretrain.py, BC_OUT for the output
+#      path) -- do NOT set policy.pretrained_path to the old
+#      bc_bimanual_v1/bc_bimanual_poc checkpoint first (shape mismatch).
+#   4. Once that fresh checkpoint exists, point policy.pretrained_path at
+#      it for live actor/learner, mirroring train_rl_push_bottle_jointspace.yaml's
+#      own comment on that same pattern.
 
 env:
   type: gym_manipulator
@@ -65,7 +85,7 @@ env:
   features:
     state:
       type: STATE
-      shape: [14]
+      shape: [15]
     wrist_l_image:
       type: VISUAL
       shape: [128, 128, 3]
@@ -80,7 +100,7 @@ env:
       shape: [128, 128, 3]
     joint_action:
       type: ACTION
-      shape: [14]
+      shape: [15]
   features_map:
     state: observation.state
     wrist_l_image: observation.images.wrist_l
@@ -135,6 +155,7 @@ env:
         # cold connect, even though all 4 topics publish at healthy rates
         # once discovered. follower_l keeps 2.0 (1 camera).
         obs_timeout_s: 5.0
+        use_gripper: true
 
   teleop:
     type: anvil_openarm_multi_leader
@@ -173,6 +194,7 @@ env:
         follower_command_topic: /follower_r_forward_position_controller/commands
         follower_joint_prefix: follower_r
         action_mode: joint_space
+        use_gripper: true
 
   processor:
     control_mode: leader
@@ -185,7 +207,11 @@ env:
       crop_params_dict: {}
       resize_size: [128, 128]
     gripper:
-      use_gripper: false
+      # See env_push_bottle_bimanual_jointspace.yaml's identical comment --
+      # functionally inert on this joint-space pipeline (confirmed via
+      # direct read of lerobot/rl/gym_manipulator.py's make_processors()/
+      # make_robot_env()), set true to accurately describe the task.
+      use_gripper: true
     reset:
       fixed_reset_joint_positions: null
       reset_time_s: 18.0
@@ -196,29 +222,36 @@ env:
     # comment: this is what makes action_processor reduce to just
     # intervention/reward handling (no EE-delta/IK, which is hardcoded to
     # a single 3-dim ee.x/y/z action and has no bimanual equivalent),
-    # letting the policy's raw 14-dim joint-position output flow straight
-    # to env.step() for both arms at once.
+    # letting the policy's raw 15-dim joint-position (+gripper) output
+    # flow straight to env.step() for both arms at once.
     inverse_kinematics: null
     reward_classifier: null
 
 # root is a container-internal path -- mount the HOST directory via
-# `-v .../data/datasets/push_bottle_bimanual_demos_combined:/tmp/push_bottle_bimanual_demos_combined:ro`.
+# `-v .../data/datasets/<new-gripper-demos-dir>:/tmp/<new-gripper-demos-dir>:ro`.
+# 2026-10-12: deliberately NOT pointed at push_bottle_bimanual_demos_combined
+# any more -- that dataset is 14-dim (no gripper), incompatible with this
+# config's now-15-dim env.features (see this file's header). Point `root`
+# at a fresh recording made against the now-also-15-dim
+# env_push_bottle_bimanual_jointspace.yaml once one exists.
 dataset:
-  repo_id: SSTC-AITeam/hilserl-push-bottle-bimanual-jointspace
-  root: /tmp/push_bottle_bimanual_demos_combined
+  repo_id: SSTC-AITeam/hilserl-push-bottle-bimanual-jointspace-gripper
+  root: /tmp/push_bottle_bimanual_gripper_demos
   video_backend: pyav
 
 policy:
   type: sac
   vision_encoder_name: /workspace/configs/hilserl/resnet10
-  # bc_bimanual_v1 (held-out corr mean +0.939, see the BC pretrain log
-  # 2026-10-02) -- mount it at this exact path via
-  # `-v .../outputs/bc_bimanual_v1:/workspace/configs/hilserl/bc_bimanual_poc:ro`.
-  # For a NEW BC pretrain run instead (producing a fresh checkpoint via
-  # BC_OUT), comment this out -- bc_pretrain.py's make_policy() call uses
-  # this same policy: block, and a non-empty pretrained_path there would
-  # load and start FROM this checkpoint rather than from scratch.
-  pretrained_path: /workspace/configs/hilserl/bc_bimanual_poc
+  # 2026-10-12: deliberately UNSET (no pretrained_path at all) -- the only
+  # existing checkpoint lineage (bc_bimanual_v1/bc_bimanual_poc) is 14-dim,
+  # trained before this config's gripper dimension existed, and is NOT
+  # loadable here (SACPolicy.from_pretrained() would hit a 14-vs-15 shape
+  # mismatch in the actor/critic heads). This intentionally reproduces the
+  # "first BC pretrain run" state train_rl_push_bottle_bimanual_jointspace.yaml
+  # was ALSO in before bc_bimanual_v1 existed -- see this file's header for
+  # the full fresh-BC-pretrain sequence this now requires. Once a NEW,
+  # 15-dim BC checkpoint exists (via bc_pretrain.py's BC_OUT), point
+  # pretrained_path at it here for live actor/learner.
   device: cuda
   push_to_hub: false
   storage_device: cuda

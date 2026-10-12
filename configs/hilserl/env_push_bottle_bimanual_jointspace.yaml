@@ -11,10 +11,23 @@
 # Usage: ros2 run lerobot_control hilserl_gym_manipulator --config_path <this file>
 #
 # Same composite classes, same joint-space convention
-# (processor.inverse_kinematics: null, LEFT-then-RIGHT 14-dim state/action)
-# as train_rl_push_bottle_bimanual_jointspace.yaml -- see that file's header
+# (processor.inverse_kinematics: null, LEFT-then-RIGHT 15-dim state/action:
+# 7 left joints + 7 right joints + follower_r's gripper, see below) as
+# train_rl_push_bottle_bimanual_jointspace.yaml -- see that file's header
 # for the full rationale. Keep the two files' `env:` blocks in sync if either
 # changes (camera topics, controller names, per-arm limits).
+#
+# Gripper (2026-10-12): follower_r/leader_r only -- NOT follower_l/leader_l.
+# This task's dataset.task (below) only has the RIGHT arm picking up an
+# object (the eventual, not-yet-collected goal: "pick up the yellow object
+# and place it onto the plate"); the left arm only pushes a plate into
+# position, which needs no grasp. See
+# ros2/.../robot_anvil_openarm.py's AnvilOpenArmFollowerConfig.use_gripper
+# and teleop_anvil_openarm_leader.py's AnvilOpenArmLeaderConfig.use_gripper
+# for the implementation -- the extra 15th action/state dimension is the
+# gripper's own raw position in METERS (finger_joint1 is prismatic,
+# 0.0-0.05m per configs/hilserl/urdf/openarm_teleop_kinematics.urdf), not
+# degrees like the other 14.
 
 env:
   name: real_robot
@@ -23,7 +36,7 @@ env:
   features:
     state:
       type: STATE
-      shape: [14]
+      shape: [15]
     wrist_l_image:
       type: VISUAL
       shape: [128, 128, 3]
@@ -38,7 +51,7 @@ env:
       shape: [128, 128, 3]
     joint_action:
       type: ACTION
-      shape: [14]
+      shape: [15]
   features_map:
     state: observation.state
     wrist_l_image: observation.images.wrist_l
@@ -71,6 +84,7 @@ env:
         control_frequency: 10.0
         max_position_delta: 0.08
         max_command_step_rad: 0.06
+        use_gripper: true
         # Bumped from 2.0 (connect()'s real deadline is this * 3 = 15s, not
         # 6s) -- 2026-10-02: a real connect() attempt timed out waiting for
         # a complete observation across 3 cameras + joint_states at once
@@ -114,6 +128,7 @@ env:
         follower_command_topic: /follower_r_forward_position_controller/commands
         follower_joint_prefix: follower_r
         action_mode: joint_space
+        use_gripper: true
 
   processor:
     control_mode: leader
@@ -129,7 +144,15 @@ env:
       resize_size: [128, 128]
 
     gripper:
-      use_gripper: false
+      # Functionally inert on THIS joint-space pipeline (make_processors()
+      # only reads this to size RobotEnv's own unused 3(+1)-dim EE-delta
+      # action_space Box, and to gate InterventionActionProcessorStep's
+      # dict-shaped teleop_action branch, which our ndarray-shaped
+      # teleop_action never hits -- confirmed via direct read of
+      # lerobot/rl/gym_manipulator.py and lerobot/processor/hil_processor.py).
+      # Set true anyway to accurately describe the task (follower_r/leader_r
+      # now have a real, controllable gripper -- see this file's header).
+      use_gripper: true
 
     reset:
       fixed_reset_joint_positions: null
@@ -150,14 +173,17 @@ dataset:
   # bind-mount's target always presents as an existing directory. See
   # env_push_bottle.yaml's identical comment for the full story.
   root: /tmp/push_bottle_bimanual_host/push_bottle_bimanual_demos
-  # Two independent, uncoordinated pushes (no gripper yet) -- right arm
-  # pushes a yellow ornament between its own two red marks, left arm pushes
-  # a light blue plate between its own (different) two red marks.
-  # Intentionally the easy first bimanual task: validates both arms'
-  # recording/mirroring/cameras without needing any cross-arm timing or
-  # coordination. Eventual goal (needs gripper, not yet wired into this
-  # config: processor.gripper.use_gripper is false): pick up the yellow
-  # object and place it onto the plate -- a real coordinated task.
+  # Two independent, uncoordinated pushes -- right arm pushes a yellow
+  # ornament between its own two red marks, left arm pushes a light blue
+  # plate between its own (different) two red marks. Intentionally the
+  # easy first bimanual task: validates both arms' recording/mirroring/
+  # cameras without needing any cross-arm timing or coordination. Eventual
+  # goal, now that follower_r/leader_r have a real gripper wired in (see
+  # this file's header): pick up the yellow object and place it onto the
+  # plate -- a real coordinated task. Collecting THOSE demonstrations (not
+  # done yet -- needs a human on the real rig) is the next step; this
+  # dataset.task string itself still describes the simple two-push task
+  # until that happens.
   task: "right arm pushes the yellow object from its start mark to its target mark; left arm pushes the light blue plate from its start mark to its target mark"
   num_episodes_to_record: 5  # start small, matches the single-arm task's original first batch
   replay_episode: null
