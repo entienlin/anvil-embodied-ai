@@ -66,6 +66,30 @@ class AnvilOpenArmFollowerConfig(RobotConfig):
     # pass through a real, transient small-delta phase) rather than editing
     # the class constant, which stays as the dataclass default.
     liveness_window_size: int = 10
+    # Gripper/finger joint control. The underlying ROS2 controller ALWAYS
+    # expects 8 values (7 arm joints + finger_joint1 -- see
+    # gripper_joint_name below) regardless of this flag; use_gripper only
+    # controls whether that 8th value is a REAL commanded target (read from
+    # the action dict) or a passive hold of the gripper's own current
+    # position, and whether observation_features/action_features expose it
+    # to the RL/dataset layer at all. False (default) reproduces this
+    # class's original gripper-less behavior exactly -- every existing
+    # single-arm/follower_l config is unaffected.
+    use_gripper: bool = False
+    # finger_joint1 is PRISMATIC (meters), not revolute -- confirmed via
+    # configs/hilserl/urdf/openarm_teleop_kinematics.urdf's
+    # follower_r_finger_joint1 joint (`type="prismatic"`, `limit lower="0.0"
+    # upper="0.05"`). Values for this joint are therefore never run through
+    # the rad2deg/deg2rad conversion the 7 revolute arm joints use below.
+    gripper_min_m: float = 0.0
+    gripper_max_m: float = 0.05
+    # Per-tick change allowed on the gripper's PUBLISHED command -- same
+    # "don't let consecutive commands slam between extremes" motivation as
+    # max_command_step_rad above, sized independently since the gripper's
+    # whole range (0.05m) is tiny next to an arm joint's. 0.01m/tick at
+    # this task's 10Hz control_frequency opens/closes fully in ~0.5s. None
+    # disables (matches max_command_step_rad's own convention).
+    max_gripper_command_step_m: float | None = 0.01
 
 
 class _BusShim:
@@ -141,13 +165,27 @@ class AnvilOpenArmFollower(Robot):
         # gets the controller safety-deactivated by controller_manager
         # ("command size (7) does not match number of interfaces (8)") --
         # confirmed the hard way, this exact fault cascaded into two subsequent
-        # switch_controller failures before being traced back to this. Not
-        # exposed via observation_features/action_features -- purely an
-        # internal ROS2 command-vector correctness detail, invisible to the
-        # RL/dataset layer, which stays 7-dim per the task's actual design.
+        # switch_controller failures before being traced back to this.
+        # Exposed via observation_features/action_features (and therefore
+        # to the RL/dataset layer) only when config.use_gripper=True -- see
+        # that field's docstring. With use_gripper=False (the original,
+        # still-default behavior) this joint stays purely an internal
+        # ROS2 command-vector correctness detail, invisible above this
+        # class, exactly as before.
         self.gripper_joint_name = f"{config.ros_prefix}_finger_joint1"
 
-        self.bus = _BusShim(self.joint_names)
+        # bus.motors is what RobotEnv (lerobot.rl.gym_manipulator) actually
+        # iterates to decide the action/observation vector's joint order --
+        # see RobotEnv._get_observation()/step(), both of which read
+        # robot.bus.motors.keys() directly, never self.joint_names. Keep
+        # self.joint_names itself arm-only (7 revolute joints) everywhere
+        # else in this class: the degree-based clamping/liveness math below
+        # assumes a homogeneous revolute-joint vector and would be wrong if
+        # the gripper (prismatic, meters) were mixed into it.
+        bus_motor_names = list(self.joint_names)
+        if config.use_gripper:
+            bus_motor_names.append(self.gripper_joint_name)
+        self.bus = _BusShim(bus_motor_names)
         self.cameras = dict.fromkeys(config.camera_topics)
 
         self._obs_manager = ObservationManager(device="cpu")
@@ -222,13 +260,18 @@ class AnvilOpenArmFollower(Robot):
     @property
     def observation_features(self) -> dict:
         feats: dict = {f"{j}.pos": float for j in self.joint_names}
+        if self.config.use_gripper:
+            feats[f"{self.gripper_joint_name}.pos"] = float
         for cam_name in self.config.camera_topics:
             feats[cam_name] = (480, 640, 3)  # (H, W, C) placeholder; actual shape confirmed at runtime
         return feats
 
     @property
     def action_features(self) -> dict:
-        return {f"{j}.pos": float for j in self.joint_names}
+        feats: dict = {f"{j}.pos": float for j in self.joint_names}
+        if self.config.use_gripper:
+            feats[f"{self.gripper_joint_name}.pos"] = float
+        return feats
 
     @property
     def is_connected(self) -> bool:
@@ -545,6 +588,16 @@ class AnvilOpenArmFollower(Robot):
             # lerobot/model/kinematics.py's deg2rad/rad2deg calls).
             obs[f"{j}.pos"] = float(np.rad2deg(name_to_pos[j]))
 
+        if self.config.use_gripper:
+            if self.gripper_joint_name not in name_to_pos:
+                raise KeyError(
+                    f"AnvilOpenArmFollower: use_gripper=True but '{self.gripper_joint_name}' not "
+                    f"found in /joint_states (saw: {list(name_to_pos)[:5]}...)."
+                )
+            # Raw meters, NOT rad2deg -- finger_joint1 is prismatic (see
+            # gripper_min_m/gripper_max_m's docstring in the config above).
+            obs[f"{self.gripper_joint_name}.pos"] = float(name_to_pos[self.gripper_joint_name])
+
         for cam_name in self.config.camera_topics:
             obs[cam_name] = self._obs_manager.latest_images[cam_name]
 
@@ -563,6 +616,13 @@ class AnvilOpenArmFollower(Robot):
         """Raise if we've been commanding real movement for a full window
         with zero observed response -- see the watchdog docstring in
         __init__ for why this exists and what it's protecting against.
+
+        Deliberately ARM-ONLY: commanded_rad/observed_rad never include the
+        gripper, by construction (callers only ever pass the 7-joint
+        arrays). A grasp holding against a real object is EXPECTED to stop
+        moving while still being commanded -- that's a legitimate contact
+        state, not a fault, and including the gripper here would make this
+        watchdog trip on every successful grasp.
         """
         if observed_rad is None:
             # Can't evaluate this tick (joint state incomplete) -- don't
@@ -672,12 +732,34 @@ class AnvilOpenArmFollower(Robot):
                 "vector this controller expects (see gripper_joint_name's docstring in "
                 "__init__ for why 7 values isn't enough)."
             )
-        # Hold the gripper at its own current position -- this task never
-        # commands it, so echo it back rather than moving it.
-        gripper_hold_rad = float(name_to_pos[self.gripper_joint_name])
+
+        if self.config.use_gripper:
+            gripper_key = f"{self.gripper_joint_name}.pos"
+            if gripper_key not in action:
+                raise KeyError(
+                    f"AnvilOpenArmFollower.send_action(): use_gripper=True but '{gripper_key}' "
+                    "missing from action -- action_features declares this key, so every caller "
+                    "(RobotEnv.step(), the composite's send_action(), any test) must provide it."
+                )
+            gripper_cmd_m = float(
+                np.clip(action[gripper_key], self.config.gripper_min_m, self.config.gripper_max_m)
+            )
+            gripper_step = self.config.max_gripper_command_step_m
+            if gripper_step is not None:
+                with self._publish_lock:
+                    last = self._last_sent_msg
+                if last is not None:
+                    last_gripper_m = float(last.data[-1])
+                    delta = gripper_cmd_m - last_gripper_m
+                    if abs(delta) > gripper_step:
+                        gripper_cmd_m = last_gripper_m + gripper_step * (1.0 if delta > 0 else -1.0)
+        else:
+            # Hold the gripper at its own current position -- unchanged
+            # from this class's original gripper-less behavior.
+            gripper_cmd_m = float(name_to_pos[self.gripper_joint_name])
 
         out_msg = Float64MultiArray()
-        out_msg.data = clamped_rad.tolist() + [gripper_hold_rad]
+        out_msg.data = clamped_rad.tolist() + [gripper_cmd_m]
 
         with self._publish_lock:
             now = time.monotonic()
@@ -703,7 +785,10 @@ class AnvilOpenArmFollower(Robot):
             if rclpy.ok():
                 self._pub.publish(out_msg)
 
-        return {f"{j}.pos": float(np.rad2deg(v)) for j, v in zip(self.joint_names, clamped_rad, strict=False)}
+        sent = {f"{j}.pos": float(np.rad2deg(v)) for j, v in zip(self.joint_names, clamped_rad, strict=False)}
+        if self.config.use_gripper:
+            sent[f"{self.gripper_joint_name}.pos"] = gripper_cmd_m
+        return sent
 
     def disconnect(self) -> None:
         if not self._is_connected:

@@ -127,13 +127,22 @@ class AnvilOpenArmMultiLeader(Teleoperator):
             seen_prefixes.add(c.ros_prefix)
 
         self._num_joints_per_arm = [c.num_joints for c in arm_configs]
+        # One extra element per arm with use_gripper=True -- see
+        # AnvilOpenArmLeaderConfig.use_gripper. get_action() needs no
+        # change for this: it already concatenates each sub-arm's own
+        # get_action() output (which is already the right length per arm),
+        # so a gripper-enabled arm's extra element falls out of that
+        # concatenation automatically, in that arm's own position in the
+        # `arms` list order.
+        self._use_gripper_per_arm = [c.use_gripper for c in arm_configs]
         self._is_connected = False
 
     # -- Teleoperator ABC ------------------------------------------------
 
     @property
     def action_features(self) -> dict:
-        return {"dtype": "float32", "shape": (sum(self._num_joints_per_arm),), "names": None}
+        total = sum(self._num_joints_per_arm) + sum(self._use_gripper_per_arm)
+        return {"dtype": "float32", "shape": (total,), "names": None}
 
     @property
     def feedback_features(self) -> dict:

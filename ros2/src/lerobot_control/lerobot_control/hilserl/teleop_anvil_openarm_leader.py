@@ -147,6 +147,11 @@ class AnvilOpenArmLeaderConfig(TeleoperatorConfig):
     teleop_controller: str = "teleop_controller"
     follower_command_topic: str = "/follower_r_forward_position_controller/commands"
     follower_joint_prefix: str = "follower_r"
+    # Mirrors AnvilOpenArmFollowerConfig.use_gripper on the teleop side --
+    # requires action_mode="joint_space" (validated in __init__): "ee_delta"
+    # mode's fixed {"delta_x","delta_y","delta_z"} dict has no gripper slot
+    # in this project's design (see _get_action_joint_space()'s docstring).
+    use_gripper: bool = False
 
 
 class AnvilOpenArmLeader(Teleoperator):
@@ -179,6 +184,24 @@ class AnvilOpenArmLeader(Teleoperator):
         self.follower_joint_names = [
             f"{config.follower_joint_prefix}_joint{i}" for i in range(1, config.num_joints + 1)
         ] + [f"{config.follower_joint_prefix}_finger_joint1"]
+
+        if config.use_gripper and config.action_mode != "joint_space":
+            raise ValueError(
+                "AnvilOpenArmLeaderConfig: use_gripper=True requires action_mode='joint_space' "
+                f"(got {config.action_mode!r}) -- see _get_action_joint_space()'s docstring for why "
+                "'ee_delta' has no gripper slot."
+            )
+        # Leader's OWN finger joint (e.g. "leader_r_finger_joint1") -- a
+        # real, physically independent trigger/handle on the leader rig
+        # itself, confirmed via configs/hilserl/urdf/openarm_teleop_kinematics.urdf:
+        # leader_r_finger_joint1 is a real prismatic joint with the same
+        # 0.0-0.05m limit as follower_r_finger_joint1. This is NOT
+        # self.follower_joint_names' own finger entry above (that one is
+        # the FOLLOWER's gripper joint, read only for SwitchServiceClient's
+        # bumpless-transfer pre-publish) -- this is the human's actual
+        # gripper open/close signal, read off the leader hardware during
+        # intervention.
+        self.leader_gripper_joint_name = f"{config.ros_prefix}_finger_joint1"
 
         self._kinematics = RobotKinematics(
             urdf_path=config.urdf_path,
@@ -221,7 +244,8 @@ class AnvilOpenArmLeader(Teleoperator):
         # exactly one place in this whole pipeline (gym_manipulator.py's
         # control_loop), so this format is safe to use unconditionally.
         if self.config.action_mode == "joint_space":
-            return {"dtype": "float32", "shape": (self.config.num_joints,), "names": None}
+            shape = self.config.num_joints + (1 if self.config.use_gripper else 0)
+            return {"dtype": "float32", "shape": (shape,), "names": None}
         return {
             "dtype": "float32",
             "shape": (3,),
@@ -439,7 +463,10 @@ class AnvilOpenArmLeader(Teleoperator):
         if self._latest_joint_state is None:
             return False
         names = set(self._latest_joint_state.name)
-        return all(j in names for j in self.joint_names)
+        required = self.joint_names
+        if self.config.use_gripper:
+            required = [*required, self.leader_gripper_joint_name]
+        return all(j in names for j in required)
 
     @property
     def is_calibrated(self) -> bool:
@@ -546,11 +573,22 @@ class AnvilOpenArmLeader(Teleoperator):
         Reading the leader's own joint state directly has no such
         approximation error: it *is* what the native mirroring is built to
         reproduce on the follower, not a derived estimate of it.
+
+        When use_gripper=True, one extra element is appended: the leader's
+        own leader_gripper_joint_name position, in METERS, NOT degrees --
+        that joint is prismatic (see leader_gripper_joint_name's docstring
+        in __init__), so it is deliberately excluded from the rad2deg
+        conversion applied to the 7 revolute arm joints above.
         """
+        n = self.config.num_joints + (1 if self.config.use_gripper else 0)
         if not self._has_leader_joint_data():
-            return np.zeros(self.config.num_joints, dtype=np.float32)
+            return np.zeros(n, dtype=np.float32)
         name_to_pos = dict(zip(self._latest_joint_state.name, self._latest_joint_state.position, strict=False))
-        return np.rad2deg(np.array([name_to_pos[j] for j in self.joint_names], dtype=np.float32))
+        arm_deg = np.rad2deg(np.array([name_to_pos[j] for j in self.joint_names], dtype=np.float32))
+        if not self.config.use_gripper:
+            return arm_deg
+        gripper_m = np.array([name_to_pos[self.leader_gripper_joint_name]], dtype=np.float32)
+        return np.concatenate([arm_deg, gripper_m])
 
     def _get_action_ee_delta(self, is_intervening: bool) -> dict:
         if not is_intervening or self._leader_ee_ref is None:

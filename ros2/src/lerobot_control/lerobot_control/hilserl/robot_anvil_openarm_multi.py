@@ -112,7 +112,18 @@ class AnvilOpenArmMultiFollower(Robot):
         all_joint_names: list[str] = []
         all_camera_names: list[str] = []
         for arm in self._arms:
-            dup_joints = set(all_joint_names) & set(arm.joint_names)
+            # arm.bus.motors.keys(), NOT arm.joint_names: includes the
+            # gripper/finger joint when that arm's use_gripper=True (see
+            # AnvilOpenArmFollower.__init__'s bus_motor_names) -- this
+            # composite's own self.joint_names/self.bus must reflect
+            # EXACTLY what RobotEnv (gym_manipulator.py) iterates over for
+            # action/observation vector order, which reads
+            # robot.bus.motors.keys() directly, never .joint_names. For any
+            # arm with use_gripper=False (the default), this is identical
+            # to arm.joint_names -- no behavior change for follower_l or
+            # any other gripper-less arm.
+            arm_bus_names = list(arm.bus.motors.keys())
+            dup_joints = set(all_joint_names) & set(arm_bus_names)
             if dup_joints:
                 raise ValueError(
                     f"AnvilOpenArmMultiFollower: duplicate joint name(s) {dup_joints} across "
@@ -124,7 +135,7 @@ class AnvilOpenArmMultiFollower(Robot):
                     f"AnvilOpenArmMultiFollower: duplicate camera name(s) {dup_cams} across "
                     "arms -- every camera name (across ALL arms) must be unique"
                 )
-            all_joint_names.extend(arm.joint_names)
+            all_joint_names.extend(arm_bus_names)
             all_camera_names.extend(arm.config.camera_topics)
 
         self.joint_names = all_joint_names
