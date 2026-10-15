@@ -72,18 +72,39 @@ class SwitchServiceClient:
             timeout_sec=timeout_s
         )
 
+    # Real-hardware finding, 2026-10-13: a single list_controllers timeout
+    # (2s, no retry) killed the whole actor session outright -- confirmed
+    # recurring (3 sessions in a row, same signature, at a real episode-
+    # boundary reset) alongside live nvidia-smi evidence of OTHER users'
+    # unrelated jobs actively competing for the same GPU this pipeline
+    # uses (utilization went 0% -> 57% on the actor's own GPU between
+    # checks, same process PIDs). Root cause of any ONE slow response is
+    # still unconfirmed (host-side contention delaying our own executor's
+    # processing vs. the devbox's controller_manager itself being briefly
+    # slow) -- but either way, a single transient miss should not cost an
+    # entire session. Retrying a few times before giving up is the same
+    # bounded-retry pattern already used for switch_controller itself
+    # (see _handle_switch_edge's MAX_CONSECUTIVE_SWITCH_FAILURES in the
+    # leader module) -- this just extends it to the read-only call too.
+    _LIST_CONTROLLERS_MAX_ATTEMPTS = 3
+
     def _get_controller_states(self) -> dict[str, str] | None:
-        """{controller_name: state} via list_controllers, or None on failure."""
+        """{controller_name: state} via list_controllers, or None if every
+        attempt times out."""
         from controller_manager_msgs.srv import ListControllers  # deferred: ROS2-only import
 
-        future = self._list_client.call_async(ListControllers.Request())
-        deadline = time.monotonic() + self._call_timeout_s
-        while not future.done() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        if not future.done():
-            self._node.get_logger().error("SwitchServiceClient: list_controllers call timed out")
-            return None
-        return {c.name: c.state for c in future.result().controller}
+        for attempt in range(1, self._LIST_CONTROLLERS_MAX_ATTEMPTS + 1):
+            future = self._list_client.call_async(ListControllers.Request())
+            deadline = time.monotonic() + self._call_timeout_s
+            while not future.done() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if future.done():
+                return {c.name: c.state for c in future.result().controller}
+            self._node.get_logger().error(
+                f"SwitchServiceClient: list_controllers call timed out "
+                f"(attempt {attempt}/{self._LIST_CONTROLLERS_MAX_ATTEMPTS})"
+            )
+        return None
 
     def has_follower_joint_state(self) -> bool:
         """Whether at least one /joint_states message has arrived yet.
