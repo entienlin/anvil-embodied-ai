@@ -62,7 +62,45 @@ re-deriving it live during an active debugging session.
       First real-RL session: gradient updates measurably WORSENED the
       policy immediately (intervention rate ~0.39-0.50 -> ~0.54) -- an
       undertrained critic giving the actor bad early guidance. Opt-in
-      (HILSERL_ACTOR_WARMUP_STEPS) critic-only warm-up window.
+      (HILSERL_ACTOR_WARMUP_STEPS) critic-only warm-up window. Redesigned
+      2026-10-12 from a hard .step()-skip to a linear LR ramp (skipping
+      pinned Adam's internal step counter at 0 for the whole window,
+      making the first unskipped call always a maximal cold-start step)
+      and to also freeze the shared encoder for the window (optimizers["critic"]
+      otherwise keeps updating it regardless of the actor optimizer
+      freeze). As of 2026-10-15: tested at 0/200/800 steps across real
+      sessions with no effect on the episode-2-only-success pattern under
+      active investigation (see HILSERL_STATUS.md) -- warmup duration is
+      not the lever for that problem.
+  2026-10-07  patch_learner_resume_preserves_cli_online_steps_and_save_freq
+      handle_resume_logic() unconditionally replaces the whole cfg with
+      the checkpoint's OWN saved train_config.json, silently discarding
+      whatever --policy.online_steps/--save_freq this invocation was
+      launched with -- also made the online-steps auto-stop safety net
+      permanently inert across any resume.
+  2026-10-07  patch_learner_resume_offline_buffer_from_source
+      On --resume=true, reloading the offline buffer from its saved
+      snapshot hits a real lerobot save/load mismatch (snapshot is
+      missing meta/episodes/) that silently falls back to a Hub download
+      using a repo_id never actually pushed to HF -- a hard 401 crash
+      blocking every resumed actor connection.
+  2026-10-07  patch_learner_resume_online_buffer_tolerates_broken_snapshot
+      Same root cause as the patch above, applied to the online replay
+      buffer (genuinely-accumulated live transitions with no other source
+      to fall back to) -- reload failure now logs and continues with an
+      empty online buffer instead of crashing the whole resume.
+  2026-10-07  patch_learner_pauses_training_when_actor_idle
+      The learner's main loop never pauses based on whether an actor is
+      still connected -- one real completed episode was enough to let it
+      keep training for 550+ further optimization steps across three
+      subsequent sessions that each crashed before completing a single
+      episode, grounded in nothing but stale data. Verified working
+      overnight (2026-10-08) across a ~14-hour unattended gap.
+  2026-10-08  patch_logging_includes_tracebacks
+      lerobot's init_logging() never renders exc_info, so grpc's own
+      logging.exception() calls (e.g. "Exception iterating requests!")
+      silently lost the real underlying error -- blocked root-causing two
+      separate real session-ending actor crashes from the log alone.
   2026-09-24  patch_robot_env_step_keeps_intervention_flag
       RobotEnv.step() silently zeroes the per-step IS_INTERVENTION flag,
       so logged intervention rate always read 0.0.
@@ -1590,16 +1628,32 @@ def save_actor_trajectory(transitions) -> str | None:
 
     BC-only test runs never train, so the learner never exports its replay
     buffer and everything the actor did was lost. This saves, per episode, as
-    an uncompressed .npz: joint state (degrees, as observed), the wrist image
-    the policy saw (float16, 3x128x128), the EXECUTED action (the human's when
-    intervening, the policy's otherwise), reward, done, and a per-step
-    `is_intervention` flag (carried in complementary_info["discrete_penalty"],
-    a slot this gripper-less task never uses -- see
-    patch_intervention_flag_in_complementary_info). That is exactly what a
-    DAgger-style retrain needs: the human's corrections at the states the
-    policy actually reached. Directory: $HILSERL_TRAJ_DIR (default
-    /workspace/outputs/actor_trajectories -- mount ~/.../outputs there on the
-    ACTOR container to keep it). Logging only: any failure is swallowed.
+    an uncompressed .npz: joint state (degrees, as observed), EVERY camera
+    image the policy saw (float16, 3x128x128 each -- see below), the
+    EXECUTED action (the human's when intervening, the policy's otherwise),
+    reward, done, and a per-step `is_intervention` flag (carried in
+    complementary_info["discrete_penalty"], a slot this gripper-less task
+    never uses -- see patch_intervention_flag_in_complementary_info). That
+    is exactly what a DAgger-style retrain needs: the human's corrections at
+    the states the policy actually reached. Directory: $HILSERL_TRAJ_DIR
+    (default /workspace/outputs/actor_trajectories -- mount ~/.../outputs
+    there on the ACTOR container to keep it). Logging only: any failure is
+    swallowed.
+
+    All-cameras fix, 2026-10-13: this originally hardcoded a single
+    "observation.images.wrist_r" key (true single-arm-era design, never
+    updated for bimanual's 4 cameras) -- confirmed the hard way, running a
+    DAgger-style BC retrain against the 110 episodes saved since crashed
+    with KeyError: 'observation.images.wrist_l', because _Arrays/_KEYS in
+    bc_pretrain.py (already generalized to N cameras for the base dataset
+    path) needs every camera the policy's encoder expects, not just one.
+    Now saves every "observation.images.*" key present in the transition's
+    state dict generically, each under its own npz array
+    (image_<camera_name>, stripping the prefix) -- matches _Frames'
+    already-generic approach on the base-dataset side, just applied here
+    too. _human_segments()/_Arrays in bc_pretrain.py were updated to read
+    these multi-camera arrays back, with a documented fallback for the 110
+    already-saved single-camera ("image") files from before this fix.
     """
     import os as _os
     import time as _time
@@ -1626,9 +1680,12 @@ def save_actor_trajectory(transitions) -> str | None:
             dtype=_np.float32,
         )
         arrays = dict(state_deg=state, action=action, reward=reward, done=done, is_intervention=flag)
-        img_key = "observation.images.wrist_r"
-        if all(img_key in t["state"] for t in transitions):
-            arrays["image"] = _np.stack([_img(t["state"][img_key]) for t in transitions])
+        img_prefix = "observation.images."
+        cam_keys = [k for k in transitions[0]["state"] if k.startswith(img_prefix)]
+        for img_key in cam_keys:
+            cam_name = img_key[len(img_prefix) :]
+            if all(img_key in t["state"] for t in transitions):
+                arrays[f"image_{cam_name}"] = _np.stack([_img(t["state"][img_key]) for t in transitions])
         path = _os.path.join(out_dir, f"ep_{_time.strftime('%Y%m%d_%H%M%S')}_{len(transitions)}steps.npz")
         _np.savez(path, **arrays)
         return path

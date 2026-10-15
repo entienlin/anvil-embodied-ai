@@ -236,7 +236,21 @@ COMMON_ARGS=(
     # policy.pretrained_path points here. Without this mount the path
     # doesn't exist in the container, so from_pretrained() falls through
     # to treating it as a HF Hub repo id and fails validation instead.
-    -v "$MAIN_REPO/outputs/bc_bimanual_v1:/workspace/configs/hilserl/bc_bimanual_poc:ro"
+    # Switched to bc_bimanual_v3, 2026-10-14 -- supersedes bc_bimanual_v2.
+    # v2's DAgger retrain folded in human corrections from the 110
+    # episodes recorded before the all-cameras fix, which meant ~91% of
+    # its effective training signal (corrections, weighted 3x) had 3 of 4
+    # cameras zero-filled -- confirmed as the likely cause of v2's
+    # real-hardware lineage still showing the same "approaches fine, then
+    # goes static, human finishes the push" pattern it was meant to fix
+    # (held-out eval couldn't catch this: it was measured on the same
+    # camera-blanked distribution). v3 retrains from bc_bimanual_v1 again
+    # using ONLY the 34 full-camera episodes recorded since that fix
+    # (1253 real correction steps, zero blanked frames) -- held-out corr
+    # +0.930. Starting from this checkpoint means a FRESH lineage (new
+    # --run-name, no --resume) -- not compatible with resuming any
+    # checkpoint saved against v1 or v2.
+    -v "$MAIN_REPO/outputs/bc_staging2/bc_bimanual_v3:/workspace/configs/hilserl/bc_bimanual_poc:ro"
     # Mount the RUN's parent dir, not /workspace/outputs/<role> directly --
     # each process creates its own leaf subdir at startup, so it must not
     # already exist inside the container (see header comment).

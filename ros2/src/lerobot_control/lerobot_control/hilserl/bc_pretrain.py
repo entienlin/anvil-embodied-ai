@@ -170,41 +170,58 @@ def _smooth(a: np.ndarray, k: int) -> np.ndarray:
 class _Arrays(torch.utils.data.Dataset):
     """In-memory frames (from actor trajectory files).
 
-    NOT yet generalized to N cameras like _Frames above was (2026-10-02) --
-    this path (BC_TRAJ_DIRS, DAgger-style corrections from saved actor
-    trajectories) is single-camera only (hardcodes "observation.images.wrist_r"
-    below), since save_actor_trajectory() itself only ever saved one
-    camera's frames. Not a blocker for the first bimanual BC pretrain (no
-    saved trajectories exist yet to correct from), but will need the same
-    treatment as _Frames before a bimanual DAgger round is possible.
+    Generalized to N cameras, 2026-10-13, matching _Frames above -- see
+    _human_segments()'s docstring for why (save_actor_trajectory() used to
+    hardcode wrist_r only; both sides are now generic).
     """
 
-    def __init__(self, state, image, targets, raw):
-        self.state, self.image, self.targets, self.raw = state, image, targets, raw
+    def __init__(self, state, images: dict, targets, raw):
+        self.state, self.images, self.targets, self.raw = state, images, targets, raw
 
     def __len__(self):
         return len(self.state)
 
     def __getitem__(self, i):
-        return {
+        out = {
             "observation.state": torch.as_tensor(self.state[i], dtype=torch.float32),
-            "observation.images.wrist_r": torch.as_tensor(self.image[i], dtype=torch.float32),
             "action": torch.as_tensor(self.targets[i], dtype=torch.float32),
             "action_raw": torch.as_tensor(self.raw[i], dtype=torch.float32),
         }
+        for cam, arr in self.images.items():
+            out[f"observation.images.{cam}"] = torch.as_tensor(arr[i], dtype=torch.float32)
+        return out
 
 
 def _human_segments(traj_dirs: list[str], smooth: int):
-    """Contiguous runs of human-driven steps from actor trajectory files -> _Arrays."""
+    """Contiguous runs of human-driven steps from actor trajectory files -> _Arrays.
+
+    All-cameras fix, 2026-10-13: _KEYS (set by the caller before this runs)
+    now lists every camera the policy's encoder expects, not just wrist_r --
+    see save_actor_trajectory()'s own 2026-10-13 docstring update for the
+    writer-side half of this fix. Reads per-camera "image_<name>" arrays
+    generically; falls back to the legacy single "image" array (saved
+    before that fix, true of every one of the 110 episodes saved so far) as
+    wrist_r specifically, and zero-fills any OTHER required camera for
+    those legacy files -- real state/action/intervention data from those
+    episodes is still fully usable, just with blank images for 3 of 4
+    cameras on frames predating the writer fix.
+    """
     import glob
 
-    states, images, targets, raws, n_files, n_segments = [], [], [], [], 0, 0
+    cam_names = [k[len("observation.images."):] for k in _KEYS if k.startswith("observation.images.")]
+
+    per_cam, states, targets, raws, n_files, n_segments = {c: [] for c in cam_names}, [], [], [], 0, 0
+    n_legacy_single_camera = 0
     for d in traj_dirs:
         for path in sorted(glob.glob(os.path.join(d, "ep_*.npz"))):
             z = np.load(path)
-            if "image" not in z.files:
+            has_multi = any(f"image_{c}" in z.files for c in cam_names)
+            has_legacy = "image" in z.files
+            if not has_multi and not has_legacy:
                 print(f"[BC] skipping {path}: no images saved", flush=True)
                 continue
+            if not has_multi and has_legacy:
+                n_legacy_single_camera += 1
             n_files += 1
             human = z["is_intervention"] > 0.5
             i = 0
@@ -218,14 +235,33 @@ def _human_segments(traj_dirs: list[str], smooth: int):
                 seg = slice(i, j)
                 a = z["action"][seg].astype(np.float32)
                 states.append(z["state_deg"][seg])
-                images.append(z["image"][seg])
+                for cam in cam_names:
+                    cam_key = f"image_{cam}"
+                    if cam_key in z.files:
+                        per_cam[cam].append(z[cam_key][seg])
+                    elif cam == "wrist_r" and has_legacy:
+                        per_cam[cam].append(z["image"][seg])
+                    else:
+                        shape = z["image"].shape[1:] if has_legacy else z[f"image_{cam_names[0]}"].shape[1:]
+                        per_cam[cam].append(np.zeros((j - i, *shape), dtype=np.float16))
                 targets.append(_smooth(a, smooth))
                 raws.append(a)
                 n_segments += 1
                 i = j
     if not states:
         return None, n_files, 0
-    ds = _Arrays(np.concatenate(states), np.concatenate(images), np.concatenate(targets), np.concatenate(raws))
+    if n_legacy_single_camera:
+        print(
+            f"[BC] {n_legacy_single_camera}/{n_files} correction files predate the all-cameras fix -- "
+            "using their real wrist_r frames, zero-filled placeholders for the other cameras",
+            flush=True,
+        )
+    ds = _Arrays(
+        np.concatenate(states),
+        {c: np.concatenate(v) for c, v in per_cam.items()},
+        np.concatenate(targets),
+        np.concatenate(raws),
+    )
     return ds, n_files, n_segments
 
 
