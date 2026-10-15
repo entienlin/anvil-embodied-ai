@@ -43,8 +43,14 @@ def main() -> int:
         if z["state_deg"].shape != (5, 7) or z["action"].shape != (5, 3) or z["reward"].sum() != 1.0 or z["done"][-1] != 1.0:
             print(f"[FAIL] wrong contents: { {k: z[k].shape for k in z.files} }", flush=True)
             return 1
-        if z["image"].shape != (5, 3, 8, 8) or z["image"].dtype != np.float16 or not np.isclose(float(z["image"][2].mean()), 0.2, atol=1e-3):
-            print(f"[FAIL] image wrong: {z['image'].shape} {z['image'].dtype}", flush=True)
+        # save_actor_trajectory() now saves one "image_<camera>" array per
+        # camera key (2026-10-13 all-cameras fix) instead of a single
+        # generic "image" array -- this test's one wrist_r camera lands at
+        # "image_wrist_r".
+        if z["image_wrist_r"].shape != (5, 3, 8, 8) or z["image_wrist_r"].dtype != np.float16 or not np.isclose(
+            float(z["image_wrist_r"][2].mean()), 0.2, atol=1e-3
+        ):
+            print(f"[FAIL] image wrong: {z['image_wrist_r'].shape} {z['image_wrist_r'].dtype}", flush=True)
             return 1
         if list(z["is_intervention"]) != [0, 0, 0, 1, 1]:
             print(f"[FAIL] intervention flag wrong: {z['is_intervention']}", flush=True)
@@ -53,7 +59,7 @@ def main() -> int:
 
         p2 = save_actor_trajectory(_transitions(with_flag=False, with_image=False))
         z2 = np.load(p2)
-        if "image" in z2.files or z2["is_intervention"].sum() != 0:
+        if any(k.startswith("image") for k in z2.files) or z2["is_intervention"].sum() != 0:
             print("[FAIL] missing image/flag should degrade gracefully", flush=True)
             return 1
         print("[OK] missing image / flag degrades gracefully", flush=True)
