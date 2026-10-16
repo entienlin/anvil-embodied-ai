@@ -175,12 +175,12 @@ env:
     reward_classifier: null  # v1: manual success/failure via keyboard, same as single-arm
 
 dataset:
-  repo_id: SSTC-AITeam/hilserl-push-bottle-bimanual-jointspace
+  repo_id: SSTC-AITeam/hilserl-grasp-place-bimanual-jointspace
   # Mount the PARENT directory, not this exact path -- LeRobotDataset.create()
   # refuses to create a dataset at a path that already exists, and a Docker
   # bind-mount's target always presents as an existing directory. See
   # env_push_bottle.yaml's identical comment for the full story.
-  root: /tmp/push_bottle_bimanual_host/push_bottle_bimanual_demos
+  root: /tmp/grasp_place_bimanual_host/grasp_place_bimanual_demos
   # 2026-10-16: real grasp-and-place task (first time any gripper code
   # touches real hardware -- everything before this was fake-hardware-only,
   # see _bimanual11/_bimanual13 tests). Superseded the earlier
