@@ -21,13 +21,13 @@
 #
 # Gripper (2026-10-12, both arms as of 2026-10-13): ALL FOUR arms
 # (follower_l, follower_r, leader_l, leader_r) now have a real,
-# independently-controllable gripper dimension. Originally wired for
-# follower_r/leader_r only (this task's CURRENT dataset.task below only has
-# the right arm picking up an object) -- widened to all 4 arms because this
-# task's own design isn't settled yet and the project needs general
-# 4-gripper capability regardless of exactly how this specific task
-# evolves (e.g. BC demos with either arm grasping, live RL intervention on
-# either arm). See ros2/.../robot_anvil_openarm.py's
+# independently-controllable gripper dimension. Widened to all 4 arms
+# because this task's own design wasn't settled yet at the time and the
+# project needs general 4-gripper capability regardless of exactly how
+# any specific task evolves (e.g. BC demos with either arm grasping, live
+# RL intervention on either arm). The task is now settled (see
+# dataset.task below: grasp-and-place, right arm) but the schema stays
+# 4-gripper-wide on purpose. See ros2/.../robot_anvil_openarm.py's
 # AnvilOpenArmFollowerConfig.use_gripper and
 # teleop_anvil_openarm_leader.py's AnvilOpenArmLeaderConfig.use_gripper for
 # the implementation -- each gripper dimension is that arm's own raw
@@ -181,20 +181,17 @@ dataset:
   # bind-mount's target always presents as an existing directory. See
   # env_push_bottle.yaml's identical comment for the full story.
   root: /tmp/push_bottle_bimanual_host/push_bottle_bimanual_demos
-  # Two independent, uncoordinated pushes -- right arm pushes a yellow
-  # ornament between its own two red marks, left arm pushes a light blue
-  # plate between its own (different) two red marks. Intentionally the
-  # easy first bimanual task: validates both arms' recording/mirroring/
-  # cameras without needing any cross-arm timing or coordination. Eventual
-  # goal: pick up the yellow object and place it onto the plate -- a real
-  # coordinated task. All 4 arms now have a real gripper wired in (see
-  # this file's header) specifically so this isn't locked into "only the
-  # right arm ever grasps" -- this task's own design (which arm picks up
-  # what) isn't settled yet. Collecting THOSE demonstrations (not done
-  # yet -- needs a human on the real rig) is the next step; this
-  # dataset.task string itself still describes the simple two-push task
-  # until that happens.
-  task: "right arm pushes the yellow object from its start mark to its target mark; left arm pushes the light blue plate from its start mark to its target mark"
+  # 2026-10-16: real grasp-and-place task (first time any gripper code
+  # touches real hardware -- everything before this was fake-hardware-only,
+  # see _bimanual11/_bimanual13 tests). Superseded the earlier
+  # "two independent uncoordinated pushes" placeholder task now that the
+  # user has a concrete gripper task in mind. Assumed single-arm
+  # (follower_r/leader_r), matching this project's established convention
+  # of the right arm being the one that manipulates objects -- left arm
+  # is still recorded (16-dim state/action, 4 cameras, unchanged schema)
+  # but expected to stay at rest for this task. Confirm/correct if a
+  # different arm or real bimanual coordination was intended.
+  task: "grasp the red object and place it in the middle of the light blue plate"
   num_episodes_to_record: 5  # start small, matches the single-arm task's original first batch
   replay_episode: null
   push_to_hub: false
