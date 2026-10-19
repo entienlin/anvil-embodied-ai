@@ -253,22 +253,19 @@ dataset:
   # dataset: block, same repo_id/root convention) -- was a placeholder
   # path from before any gripper demos existed.
   repo_id: SSTC-AITeam/hilserl-grasp-place-bimanual-jointspace
-  root: /tmp/grasp_place_bimanual_host/grasp_place_bimanual_demos
+  # Matches run_hilserl_bimanual.sh's DATASET_HOST mount target exactly
+  # (-v "$DATASET_HOST:/tmp/grasp_place_bimanual_demos:ro").
+  root: /tmp/grasp_place_bimanual_demos
   video_backend: pyav
 
 policy:
   type: sac
   vision_encoder_name: /workspace/configs/hilserl/resnet10
-  # 2026-10-12: deliberately UNSET (no pretrained_path at all) -- the only
-  # existing checkpoint lineage (bc_bimanual_v1/bc_bimanual_poc) is 14-dim,
-  # trained before this config's gripper dimensions existed, and is NOT
-  # loadable here (SACPolicy.from_pretrained() would hit a 14-vs-16 shape
-  # mismatch in the actor/critic heads). This intentionally reproduces the
-  # "first BC pretrain run" state train_rl_push_bottle_bimanual_jointspace.yaml
-  # was ALSO in before bc_bimanual_v1 existed -- see this file's header for
-  # the full fresh-BC-pretrain sequence this now requires. Once a NEW,
-  # 16-dim BC checkpoint exists (via bc_pretrain.py's BC_OUT), point
-  # pretrained_path at it here for live actor/learner.
+  # 2026-10-19: bc_grasp_place_v1 -- first real BC checkpoint for this
+  # task (5 demos, train-loss-only gate, no held-out set -- see this
+  # checkpoint's own training log). Matches run_hilserl_bimanual.sh's
+  # mount target exactly.
+  pretrained_path: /workspace/configs/hilserl/bc_grasp_place_poc
   device: cuda
   push_to_hub: false
   storage_device: cuda
@@ -276,7 +273,12 @@ policy:
   policy_kwargs:
     std_max: 0.5
   online_steps: 4000
-  online_step_before_learning: 10
+  # 100000, not 10 -- BC-only for this first real-hardware check (matches
+  # the established pattern from the push-bottle task: judge the raw BC
+  # checkpoint's own behavior before any real gradient step can touch it).
+  # Lower this once bc_grasp_place_v1's real-hardware behavior is assessed
+  # and RL is actually wanted.
+  online_step_before_learning: 100000
   temperature_init: 0.01
   online_buffer_capacity: 2000
   offline_buffer_capacity: 4000

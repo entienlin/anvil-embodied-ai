@@ -141,7 +141,7 @@ MAIN_REPO="$(cd "$(dirname "$(git rev-parse --git-common-dir)")" && pwd)"
 # expected and fine; only the host-side RUNS_ROOT/RUN_DIR creation below
 # needs to avoid the pre-existing root-owned tree.
 RUNS_ROOT="$MAIN_REPO/outputs/hilserl_bimanual_runs"
-DATASET_HOST="$MAIN_REPO/data/datasets/push_bottle_bimanual_demos_combined"
+DATASET_HOST="$MAIN_REPO/data/datasets/grasp_place_bimanual_demos"
 
 if [[ ! -d "$DATASET_HOST" ]]; then
     echo "Dataset not found at $DATASET_HOST -- check MAIN_REPO resolved correctly." >&2
@@ -230,27 +230,17 @@ COMMON_ARGS=(
     -e ROS_DOMAIN_ID=1
     -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     -e CYCLONEDDS_URI=file:///workspace/configs/cyclonedds/two_pc_gpu.xml
-    -v "$DATASET_HOST:/tmp/push_bottle_bimanual_demos_combined:ro"
+    -v "$DATASET_HOST:/tmp/grasp_place_bimanual_demos:ro"
     # Required by BOTH learner and actor -- each constructs its own SAC
     # policy locally via make_policy(cfg.policy), and the config's
     # policy.pretrained_path points here. Without this mount the path
     # doesn't exist in the container, so from_pretrained() falls through
     # to treating it as a HF Hub repo id and fails validation instead.
-    # Switched to bc_bimanual_v3, 2026-10-14 -- supersedes bc_bimanual_v2.
-    # v2's DAgger retrain folded in human corrections from the 110
-    # episodes recorded before the all-cameras fix, which meant ~91% of
-    # its effective training signal (corrections, weighted 3x) had 3 of 4
-    # cameras zero-filled -- confirmed as the likely cause of v2's
-    # real-hardware lineage still showing the same "approaches fine, then
-    # goes static, human finishes the push" pattern it was meant to fix
-    # (held-out eval couldn't catch this: it was measured on the same
-    # camera-blanked distribution). v3 retrains from bc_bimanual_v1 again
-    # using ONLY the 34 full-camera episodes recorded since that fix
-    # (1253 real correction steps, zero blanked frames) -- held-out corr
-    # +0.930. Starting from this checkpoint means a FRESH lineage (new
-    # --run-name, no --resume) -- not compatible with resuming any
-    # checkpoint saved against v1 or v2.
-    -v "$MAIN_REPO/outputs/bc_staging2/bc_bimanual_v3:/workspace/configs/hilserl/bc_bimanual_poc:ro"
+    # 2026-10-19: gripper/grasp-place task, first BC checkpoint
+    # (bc_grasp_place_v1) -- 5 real demos, no held-out set (too few
+    # episodes for a meaningful holdout), train-loss-only gate. See this
+    # checkpoint's own training log for per-dimension train correlation.
+    -v "$MAIN_REPO/outputs/bc_staging/bc_grasp_place_v1:/workspace/configs/hilserl/bc_grasp_place_poc:ro"
     # Mount the RUN's parent dir, not /workspace/outputs/<role> directly --
     # each process creates its own leaf subdir at startup, so it must not
     # already exist inside the container (see header comment).
