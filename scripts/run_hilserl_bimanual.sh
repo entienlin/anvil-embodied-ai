@@ -236,11 +236,20 @@ COMMON_ARGS=(
     # policy.pretrained_path points here. Without this mount the path
     # doesn't exist in the container, so from_pretrained() falls through
     # to treating it as a HF Hub repo id and fails validation instead.
-    # 2026-10-19: gripper/grasp-place task, first BC checkpoint
-    # (bc_grasp_place_v1) -- 5 real demos, no held-out set (too few
-    # episodes for a meaningful holdout), train-loss-only gate. See this
-    # checkpoint's own training log for per-dimension train correlation.
-    -v "$MAIN_REPO/outputs/bc_staging/bc_grasp_place_v1:/workspace/configs/hilserl/bc_grasp_place_poc:ro"
+    # 2026-10-19: bc_grasp_place_v2 -- supersedes v1, which was trained
+    # without BC_ACTION_BOUNDS=auto, so its raw-degree joint targets got
+    # hard-clamped to +-0.99 (destroying virtually all positional signal
+    # for the 14 arm-joint dims) and it never saved an action_bounds.json
+    # at all, so deployment also got zero de-normalization -- matches the
+    # real-hardware symptom exactly ("goes straight down, opens/closes
+    # gripper a couple times"). v2 fixes both: real per-dim bounds now
+    # saved and auto-loaded, PLUS 520 human-correction steps (x3 weight)
+    # folded in from the v1 real-hardware session via BC_TRAJ_DIRS. Train
+    # corr now 0.994-1.0 across all 16 dims, no held-out set -- corrections
+    # (weighted) now outweigh the 5 original demos ~4.5:1 in the training
+    # mix, so this checkpoint's character leans toward "recovering from a
+    # broken run" more than a balanced reflection of the clean demos.
+    -v "$MAIN_REPO/outputs/bc_staging/bc_grasp_place_v2:/workspace/configs/hilserl/bc_grasp_place_poc:ro"
     # Mount the RUN's parent dir, not /workspace/outputs/<role> directly --
     # each process creates its own leaf subdir at startup, so it must not
     # already exist inside the container (see header comment).

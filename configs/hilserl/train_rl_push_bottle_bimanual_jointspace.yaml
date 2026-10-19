@@ -261,9 +261,13 @@ dataset:
 policy:
   type: sac
   vision_encoder_name: /workspace/configs/hilserl/resnet10
-  # 2026-10-19: bc_grasp_place_v1 -- first real BC checkpoint for this
-  # task (5 demos, train-loss-only gate, no held-out set -- see this
-  # checkpoint's own training log). Matches run_hilserl_bimanual.sh's
+  # 2026-10-19: bc_grasp_place_v2 -- supersedes v1 (trained without
+  # BC_ACTION_BOUNDS=auto, which clamped every raw-degree joint target to
+  # +-0.99 and never saved an action_bounds.json -- matches the real
+  # "goes straight down" symptom exactly). v2 fixes both and folds in 520
+  # human-correction steps from v1's real-hardware session. Train corr
+  # 0.994-1.0, still no held-out set -- see run_hilserl_bimanual.sh's own
+  # comment on this mount for the full caveat. Matches that script's
   # mount target exactly.
   pretrained_path: /workspace/configs/hilserl/bc_grasp_place_poc
   device: cuda
@@ -276,7 +280,7 @@ policy:
   # 100000, not 10 -- BC-only for this first real-hardware check (matches
   # the established pattern from the push-bottle task: judge the raw BC
   # checkpoint's own behavior before any real gradient step can touch it).
-  # Lower this once bc_grasp_place_v1's real-hardware behavior is assessed
+  # Lower this once bc_grasp_place_v2's real-hardware behavior is assessed
   # and RL is actually wanted.
   online_step_before_learning: 100000
   temperature_init: 0.01
