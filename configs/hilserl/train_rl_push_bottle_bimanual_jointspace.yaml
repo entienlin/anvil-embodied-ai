@@ -248,8 +248,12 @@ env:
 # at a fresh recording made against the now-also-16-dim
 # env_push_bottle_bimanual_jointspace.yaml once one exists.
 dataset:
-  repo_id: SSTC-AITeam/hilserl-push-bottle-bimanual-jointspace-gripper
-  root: /tmp/push_bottle_bimanual_gripper_demos
+  # 2026-10-19: points at the real recorded grasp-and-place demos (see
+  # configs/hilserl/env_push_bottle_bimanual_jointspace.yaml's own
+  # dataset: block, same repo_id/root convention) -- was a placeholder
+  # path from before any gripper demos existed.
+  repo_id: SSTC-AITeam/hilserl-grasp-place-bimanual-jointspace
+  root: /tmp/grasp_place_bimanual_host/grasp_place_bimanual_demos
   video_backend: pyav
 
 policy:
