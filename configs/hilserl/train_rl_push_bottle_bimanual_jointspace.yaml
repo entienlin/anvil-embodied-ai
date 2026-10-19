@@ -277,12 +277,20 @@ policy:
   policy_kwargs:
     std_max: 0.5
   online_steps: 4000
-  # 100000, not 10 -- BC-only for this first real-hardware check (matches
-  # the established pattern from the push-bottle task: judge the raw BC
-  # checkpoint's own behavior before any real gradient step can touch it).
-  # Lower this once bc_grasp_place_v2's real-hardware behavior is assessed
-  # and RL is actually wanted.
-  online_step_before_learning: 100000
+  # 2026-10-19: back to 10 (standard RLPD mixing) -- bc_grasp_place_v2's
+  # real-hardware behavior is confirmed good (coherent reaching/grasping
+  # motion, consistent gripper range) and locked in as the benchmark
+  # (outputs/benchmarks/bc_grasp_place_v2_benchmark). RL now starts from
+  # here. Note (push-bottle lineage, same architecture/sparse-reward
+  # setup): the critic was found to be nearly action-blind there --
+  # dimension-count dilution (14 action dims vs ~1280 encoder dims) plus
+  # small/sparse-reward data starvation, confirmed NOT fixed by actor
+  # warmup or by more gradient steps on the same small buffer. The same
+  # dynamics likely apply here. Worth tracking intervention-rate trend
+  # across sessions rather than expecting a quick fix from this switch
+  # alone -- see that investigation's findings before assuming RL alone
+  # will close the remaining grasp gap quickly.
+  online_step_before_learning: 10
   temperature_init: 0.01
   online_buffer_capacity: 2000
   offline_buffer_capacity: 4000
