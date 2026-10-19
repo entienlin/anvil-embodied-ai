@@ -24,10 +24,11 @@
 # independently-controllable gripper dimension. Widened to all 4 arms
 # because this task's own design wasn't settled yet at the time and the
 # project needs general 4-gripper capability regardless of exactly how
-# any specific task evolves (e.g. BC demos with either arm grasping, live
-# RL intervention on either arm). The task is now settled (see
-# dataset.task below: grasp-and-place, right arm) but the schema stays
-# 4-gripper-wide on purpose. See ros2/.../robot_anvil_openarm.py's
+# any specific task evolves. The task is now settled (see dataset.task
+# below) as a genuinely bimanual, SEQUENCE-DEPENDENT task -- left arm
+# pushes the plate into position, right arm's placement (not its grasp,
+# which can happen any time) must wait until the plate has arrived -- not
+# just "both arms happen to move." See ros2/.../robot_anvil_openarm.py's
 # AnvilOpenArmFollowerConfig.use_gripper and
 # teleop_anvil_openarm_leader.py's AnvilOpenArmLeaderConfig.use_gripper for
 # the implementation -- each gripper dimension is that arm's own raw
@@ -181,17 +182,21 @@ dataset:
   # bind-mount's target always presents as an existing directory. See
   # env_push_bottle.yaml's identical comment for the full story.
   root: /tmp/grasp_place_bimanual_host/grasp_place_bimanual_demos
-  # 2026-10-16: real grasp-and-place task (first time any gripper code
-  # touches real hardware -- everything before this was fake-hardware-only,
-  # see _bimanual11/_bimanual13 tests). Superseded the earlier
-  # "two independent uncoordinated pushes" placeholder task now that the
-  # user has a concrete gripper task in mind. Assumed single-arm
-  # (follower_r/leader_r), matching this project's established convention
-  # of the right arm being the one that manipulates objects -- left arm
-  # is still recorded (16-dim state/action, 4 cameras, unchanged schema)
-  # but expected to stay at rest for this task. Confirm/correct if a
-  # different arm or real bimanual coordination was intended.
-  task: "grasp the red object and place it in the middle of the light blue plate"
+  # 2026-10-19: real BIMANUAL grasp-and-place task (first time any gripper
+  # code touches real hardware -- everything before this was
+  # fake-hardware-only, see _bimanual11/_bimanual13 tests). Superseded the
+  # earlier "two independent uncoordinated pushes" placeholder task, and
+  # superseded an even-earlier single-arm-only framing of this same task
+  # (first real recording attempt showed the user intentionally drove both
+  # arms -- confirmed this is deliberate, not an uncoordinated artifact).
+  # Real sequencing dependency, not just "both arms happen to move": the
+  # right arm's GRASP can happen any time, but its PLACEMENT must wait
+  # until the left arm has finished pushing the plate to the target --
+  # placing onto a plate that hasn't arrived yet isn't meaningful. BC's
+  # job is to learn this ordering from the demonstrated correlation
+  # between plate position and placement timing, not from any explicit
+  # synchronization signal -- there isn't one.
+  task: "left arm pushes the plate from its start mark to the target mark; right arm grasps the red object, then places it in the middle of the plate once the plate has arrived at the target mark"
   num_episodes_to_record: 5  # start small, matches the single-arm task's original first batch
   replay_episode: null
   push_to_hub: false
