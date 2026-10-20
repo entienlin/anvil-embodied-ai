@@ -272,7 +272,14 @@ policy:
   pretrained_path: /workspace/configs/hilserl/bc_grasp_place_poc
   device: cuda
   push_to_hub: false
-  storage_device: cuda
+  # 2026-10-20: cuda -> cpu. Moves the replay buffers' image storage off
+  # VRAM entirely (lerobot's ReplayBuffer pre-allocates dense float32
+  # tensors per camera, no dtype override -- ~768KiB/transition for this
+  # config's 4 cameras). Required to safely raise online_buffer_capacity
+  # below without VRAM risk; real cost is a host->device copy at
+  # sample() time (~192MiB/batch at batch_size=256), not benchmarked here
+  # but estimated 10-30% of step time -- real but not prohibitive.
+  storage_device: cpu
   use_torch_compile: false
   policy_kwargs:
     std_max: 0.5
@@ -292,7 +299,15 @@ policy:
   # will close the remaining grasp gap quickly.
   online_step_before_learning: 10
   temperature_init: 0.01
-  online_buffer_capacity: 2000
+  # 2026-10-20: 2000 -> 10000 (staged -- see patch_learner_checkpoint_
+  # saves_dataset_atomically() in patches.py). Raising this alone was
+  # previously close to moot: the online buffer's contents were silently
+  # lost on nearly every real --resume (a real crash-safety bug in
+  # lerobot's own save path, now fixed), so real online data has likely
+  # never exceeded one session's worth regardless of this ceiling.
+  # Validate on real hardware (including a deliberate mid-save Ctrl+C)
+  # before considering raising this further toward 50000.
+  online_buffer_capacity: 10000
   offline_buffer_capacity: 4000
   actor_learner_config:
     learner_host: 127.0.0.1

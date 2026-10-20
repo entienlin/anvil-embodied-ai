@@ -114,6 +114,13 @@ re-deriving it live during an active debugging session.
       the robot's actual joint count -- the EE-delta IK chain always fixed
       this up before reaching env.step(), joint-space mode has no such
       chain to rely on.
+  2026-10-20  patch_learner_checkpoint_saves_dataset_atomically
+      save_training_checkpoint() rmtree's the last GOOD replay-buffer
+      snapshot BEFORE the slow rewrite -- any interruption (Ctrl+C,
+      hardware fault, OOM) between those two steps left dataset_dir gone
+      or half-written, with no way back, meaning the online buffer was
+      silently lost on nearly every real --resume. Fix: write to a
+      sibling tmp dir, atomic-rename swap only once the write succeeds.
   2026-09-21  patch_learner_stop_at_online_steps
       lerobot's learner loop never exits on reaching online_steps -- kept
       re-training on the same finite buffer forever (seen: 4000+ steps for
@@ -1457,6 +1464,7 @@ def apply_all_patches() -> None:
     patch_multi_leader_skip_reset_when_stopping()
     patch_train_pipeline_config_validate_for_optional_dataset()
     patch_learner_progress_visibility()
+    patch_learner_checkpoint_saves_dataset_atomically()
     patch_learner_stop_at_online_steps()
     patch_learner_resume_offline_buffer_from_source()
     patch_learner_resume_online_buffer_tolerates_broken_snapshot()
@@ -1472,6 +1480,136 @@ def apply_all_patches() -> None:
     patch_robot_env_step_keeps_intervention_flag()
     patch_intervention_flag_in_complementary_info()
     patch_step_env_squeezes_batched_action()
+
+
+def patch_learner_checkpoint_saves_dataset_atomically() -> None:
+    """2026-10-19/20 (gripper branch): `save_training_checkpoint()`
+    (lerobot/rl/learner.py:674-758) saves the online (and offline) replay
+    buffer to `<output_dir>/dataset` via:
+
+        if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
+            shutil.rmtree(dataset_dir)                      # destroys the last GOOD snapshot FIRST
+        replay_buffer.to_lerobot_dataset(repo_id=..., fps=fps, root=dataset_dir)  # slow; only valid once finalize() runs
+
+    `to_lerobot_dataset()` (lerobot/rl/buffer.py:509-612) already correctly
+    uses the buffer's own ground-truth done/truncated flags to call
+    save_episode() at the right boundaries, with finalize() at the end
+    flushing meta/episodes/ -- confirmed directly against real `dataset/`
+    snapshots already in this project's outputs/: when a save completes,
+    the round-trip is correct and loads cleanly. The bug is CRASH-SAFETY,
+    not episode-boundary logic: the rmtree deletes the only good copy
+    BEFORE the slow rewrite, so any interruption between that line and the
+    eventual finalize() (Ctrl+C, a hardware fault, OOM, SIGKILL -- all
+    routine in this project's real sessions) leaves dataset_dir gone or
+    half-written, with no way back. This is exactly why
+    patch_learner_resume_online_buffer_tolerates_broken_snapshot() (below)
+    was written as a catch-and-reset-to-empty safety net -- it treats the
+    symptom (a FileNotFoundError on resume), not the cause. That patch's
+    own docstring explains why reconstructing episode boundaries from raw
+    frames at LOAD time was correctly rejected as unverifiable -- but
+    that's not needed here: the ground-truth-done-flags path already
+    exists in to_lerobot_dataset() and already works once given the
+    chance to finish.
+
+    Fix: write the new snapshot to a sibling temp dir first (never
+    touching the live dataset_dir while writing), then swap it in with
+    two fast os.rename() calls -- each one atomic on the same filesystem
+    (this project's outputs/ is one mount, no cross-device rename risk).
+    If the process dies before both renames, the old dataset_dir is never
+    touched at all -- only transitions since the LAST SUCCESSFUL
+    checkpoint are ever at risk, never the whole history. This is a full
+    reimplementation of save_training_checkpoint (not a before/after
+    wrap) because the risky rmtree-then-write logic is inline in that
+    function's body, not a separately wrappable sub-step -- steps 1-4
+    (checkpoint dir, policy/optimizer save, training-state, "last"
+    symlink) are unchanged, calling the exact same already-imported
+    helpers the original uses so this tracks lerobot's own helpers rather
+    than duplicating their logic.
+
+    MUST be registered before patch_learner_stop_at_online_steps() (next
+    in this file): that patch captures `orig_save =
+    learner_mod.save_training_checkpoint` at the moment IT runs and wraps
+    it -- this patch must already be in place first so the stop-patch
+    wraps OUR atomic version, not the raw original.
+    """
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_atomic_checkpoint_save_patched", False):
+        return
+    learner_mod._anvil_atomic_checkpoint_save_patched = True
+
+    import logging
+    import os as _os
+    import shutil as _shutil
+
+    import torch as _torch
+
+    def _swap_in(tmp_dir: str, live_dir: str) -> None:
+        prev_dir = live_dir + ".prev"
+        if _os.path.exists(prev_dir):
+            _shutil.rmtree(prev_dir)  # leftover from a prior interrupted swap
+        if _os.path.exists(live_dir):
+            _os.rename(live_dir, prev_dir)
+        _os.rename(tmp_dir, live_dir)
+        if _os.path.exists(prev_dir):
+            _shutil.rmtree(prev_dir)
+
+    def _save_training_checkpoint(
+        cfg,
+        optimization_step,
+        online_steps,
+        interaction_message,
+        policy,
+        optimizers,
+        replay_buffer,
+        offline_replay_buffer=None,
+        dataset_repo_id=None,
+        fps=30,
+    ) -> None:
+        logging.info(f"Checkpoint policy after step {optimization_step}")
+        interaction_step = interaction_message["Interaction step"] if interaction_message is not None else 0
+
+        checkpoint_dir = learner_mod.get_step_checkpoint_dir(cfg.output_dir, online_steps, optimization_step)
+
+        learner_mod.save_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            step=optimization_step,
+            cfg=cfg,
+            policy=policy,
+            optimizer=optimizers,
+            scheduler=None,
+        )
+
+        training_state_dir = _os.path.join(checkpoint_dir, learner_mod.TRAINING_STATE_DIR)
+        _os.makedirs(training_state_dir, exist_ok=True)
+        training_state = {"step": optimization_step, "interaction_step": interaction_step}
+        _torch.save(training_state, _os.path.join(training_state_dir, "training_state.pt"))
+
+        learner_mod.update_last_checkpoint(checkpoint_dir)
+
+        # Atomic swap: write to a sibling tmp dir, only touch the live
+        # dataset_dir with two fast renames once the slow write succeeds.
+        dataset_dir = _os.path.join(cfg.output_dir, "dataset")
+        tmp_dir = dataset_dir + ".tmp"
+        if _os.path.exists(tmp_dir):
+            _shutil.rmtree(tmp_dir)  # leftover from a prior interrupted write
+        repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
+        replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=tmp_dir)
+        _swap_in(tmp_dir, dataset_dir)
+
+        if offline_replay_buffer is not None:
+            dataset_offline_dir = _os.path.join(cfg.output_dir, "dataset_offline")
+            tmp_offline_dir = dataset_offline_dir + ".tmp"
+            if _os.path.exists(tmp_offline_dir):
+                _shutil.rmtree(tmp_offline_dir)
+            offline_replay_buffer.to_lerobot_dataset(cfg.dataset.repo_id, fps=fps, root=tmp_offline_dir)
+            _swap_in(tmp_offline_dir, dataset_offline_dir)
+
+        logging.info("Resume training")
+
+    learner_mod.save_training_checkpoint = _save_training_checkpoint
 
 
 def patch_learner_stop_at_online_steps() -> None:
