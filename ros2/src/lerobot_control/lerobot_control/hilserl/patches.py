@@ -98,6 +98,17 @@ re-deriving it live during an active debugging session.
       buffer (genuinely-accumulated live transitions with no other source
       to fall back to) -- reload failure now logs and continues with an
       empty online buffer instead of crashing the whole resume.
+  2026-10-20  patch_learner_resume_reloads_trained_weights
+      handle_resume_logic() swaps in the checkpoint's own saved
+      train_config.json, but that file's policy.pretrained_path was never
+      rewritten by save_checkpoint() -- every single --resume silently
+      reconstructed the actor/critic from the ORIGINAL BC checkpoint, not
+      from wherever training actually left off, while the optimizer's
+      momentum stayed fitted to a trajectory the (reset) weights no longer
+      matched. Only the replay buffer and optimizer step counter ever
+      genuinely survived a resume; RL training likely never accumulated
+      across sessions until this fix. Points pretrained_path at the
+      checkpoint's own pretrained_model/ dir instead.
   2026-10-07  patch_learner_pauses_training_when_actor_idle
       The learner's main loop never pauses based on whether an actor is
       still connected -- one real completed episode was enough to let it
@@ -1674,6 +1685,7 @@ def apply_all_patches() -> None:
     patch_learner_resume_offline_buffer_from_source()
     patch_learner_resume_online_buffer_tolerates_broken_snapshot()
     patch_learner_resume_preserves_cli_online_steps_and_save_freq()
+    patch_learner_resume_reloads_trained_weights()
     patch_learner_pauses_training_when_actor_idle()
     patch_sac_deterministic_inference()
     patch_sac_loads_action_bounds_on_from_pretrained()
@@ -2256,6 +2268,79 @@ def patch_learner_resume_preserves_cli_online_steps_and_save_freq() -> None:
         if was_resuming:
             new_cfg.policy.online_steps = requested_online_steps
             new_cfg.save_freq = requested_save_freq
+        return new_cfg
+
+    learner_mod.handle_resume_logic = _handle_resume_logic
+
+
+def patch_learner_resume_reloads_trained_weights() -> None:
+    """handle_resume_logic() (lerobot/rl/learner.py) swaps in the checkpoint's
+    own saved train_config.json on every --resume, but that saved config's
+    policy.pretrained_path field is NEVER updated by save_checkpoint() --
+    confirmed directly, 2026-10-20: checkpoint 000800's own train_config.json
+    still says policy.pretrained_path=".../bc_grasp_place_poc" (the ORIGINAL
+    BC checkpoint passed on this run's very first, non-resumed launch), not a
+    self-reference to its own step-800 weights -- and save_checkpoint()
+    (lerobot/utils/train_utils.py:65-110) never rewrites that field, it just
+    serializes whatever cfg.policy.pretrained_path already was into every
+    checkpoint's train_config.json unchanged, forever. make_policy()
+    (lerobot/policies/factory.py:534-538) unconditionally does
+    `policy_cls.from_pretrained(cfg.pretrained_path)` whenever pretrained_path
+    is set, with zero special-casing for resume.
+
+    Net effect: EVERY resume reconstructs the actor and critic from the
+    original BC weights, not from wherever training actually left off. The
+    only things that genuinely survive a resume are the replay buffer
+    (patch_learner_checkpoint_saves_dataset_atomically()) and the optimizer
+    state/step counter (load_training_state()) -- the network weights
+    silently reset to the BC baseline every single time, while the
+    optimizer's momentum stays fitted to a training trajectory the weights
+    no longer match (a real additional source of post-resume instability on
+    top of the reset itself). Given how often real sessions in this project
+    get interrupted and resumed, this means RL training has likely never
+    actually accumulated across sessions -- each resume re-starts from BC,
+    polluted with stale optimizer momentum from wherever the previous
+    session's training had gotten to. This also retroactively explains every
+    "saved (256,1296) != model (256,1344)" shape-mismatch log line seen on
+    resume: that was always the pre-RL, pre-embedding BC checkpoint being
+    reloaded, never the actual step-N checkpoint the log said it was
+    resuming from.
+
+    Fix: after handle_resume_logic() returns its swapped-in config, point
+    policy.pretrained_path at the checkpoint directory's own pretrained_model/
+    folder (exactly where save_checkpoint() wrote the real trained weights)
+    instead of leaving the stale original value in place. Composes with
+    patch_learner_resume_preserves_cli_online_steps_and_save_freq() (also
+    wraps handle_resume_logic) regardless of registration order, since each
+    captures its own `orig_handle_resume_logic` reference at patch time."""
+    try:
+        import lerobot.rl.learner as learner_mod
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(learner_mod, "_anvil_resume_weights_patched", False):
+        return
+    learner_mod._anvil_resume_weights_patched = True
+
+    import os as _os
+
+    orig_handle_resume_logic = learner_mod.handle_resume_logic
+
+    def _handle_resume_logic(cfg):
+        was_resuming = cfg.resume
+        out_dir = cfg.output_dir
+        new_cfg = orig_handle_resume_logic(cfg)
+        if was_resuming:
+            checkpoint_dir = _os.path.join(
+                out_dir, learner_mod.CHECKPOINTS_DIR, learner_mod.LAST_CHECKPOINT_LINK
+            )
+            pretrained_dir = _os.path.join(checkpoint_dir, learner_mod.PRETRAINED_MODEL_DIR)
+            print(
+                f"[LEARNER-DBG] resume: loading real trained weights from {pretrained_dir} "
+                f"(not the stale '{new_cfg.policy.pretrained_path}' baked into the checkpoint's "
+                "own saved config)",
+                flush=True,
+            )
+            new_cfg.policy.pretrained_path = pretrained_dir
         return new_cfg
 
     learner_mod.handle_resume_logic = _handle_resume_logic
