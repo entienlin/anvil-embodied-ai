@@ -58,6 +58,15 @@ re-deriving it live during an active debugging session.
       Surfaces per-episode intervention-rate stats (the docs' own
       definition of HIL-SERL progress) that lerobot already computes but
       never prints.
+  2026-10-20  patch_sac_critic_action_embedding
+      Confirmed (offline Q-variance diagnostic, this task's own real
+      checkpoints): the critic is nearly action-blind -- action is only
+      14-16 of ~1280 critic-input dims, pure raw concatenation. Opt-in
+      (HILSERL_CRITIC_ACTION_EMBED_DIM) action embedding before
+      concatenation. Companion patch_sac_tolerates_shape_mismatch_on_load()
+      is invoked conditionally from inside this one (not independently
+      registered below) to let a pre-existing checkpoint load with only
+      the now-reshaped critic layers starting fresh.
   2026-09-29  patch_sac_actor_warmup
       First real-RL session: gradient updates measurably WORSENED the
       policy immediately (intervention rate ~0.39-0.50 -> ~0.54) -- an
@@ -1015,6 +1024,202 @@ def patch_learner_episode_stats_logging() -> None:
     learner_mod.process_interaction_message = _process_interaction_message
 
 
+def patch_sac_critic_action_embedding() -> None:
+    """2026-10-20 (gripper branch): confirmed directly (offline Q-variance
+    diagnostic, re-run on this task's own real RL checkpoints, not just by
+    analogy to the push-bottle lineage) that the critic is nearly
+    action-blind -- perturbing the commanded action barely moves min-Q
+    compared to perturbing the state. Root cause confirmed architecturally,
+    not just empirically: CriticEnsemble.forward() (lerobot/policies/sac/
+    modeling_sac.py) does `torch.cat([obs_enc, actions], dim=-1)` --
+    actions are only 14-16 of ~1280 total critic-input dims (4 cameras x
+    256-dim encoder slots each). A controlled offline test (perturb 14
+    RANDOM encoder dims vs. the real 14 action dims, same count, same
+    perturbation scale) produced the SAME tiny Q-variance either way,
+    confirming this is pure dimension-count dilution, not the critic
+    specifically discounting action -- weight/gradient inspection on the
+    real checkpoint showed near-1:1 per-dimension magnitude between action
+    and encoder columns.
+
+    Fix: give the action its own learned embedding (Linear + SiLU,
+    HILSERL_CRITIC_ACTION_EMBED_DIM-wide, default 64) before
+    concatenation, instead of raw concatenation -- raises action's share
+    of the critic's input from ~1% to ~5% of total dims. Already
+    validated offline (scratch experiment, this session, not committed):
+    on the push-bottle lineage this raised the Q-variance ratio
+    post-training from 0.146% to 0.289% -- a real but modest improvement,
+    NOT a complete fix (the dominant remaining limiter there was data
+    starvation on a small, now-separately-fixed-elsewhere buffer, not
+    this dimension issue alone). This patch is the first time this
+    architecture change is implemented as a real, runtime-applied patch
+    rather than a one-off scratch script.
+
+    Opt-in via HILSERL_CRITIC_ACTION_EMBED_DIM (unset/0 = off, byte-for-
+    byte original architecture and behavior -- same convention as
+    HILSERL_ACTOR_WARMUP_STEPS). When off, none of this file's other
+    behavior changes; this is the ONLY place that env var is read.
+
+    Shares ONE action_embed module between critic_ensemble and
+    critic_target (not a separately Polyak-tracked copy) -- mirrors the
+    existing design already used for the observation encoder itself
+    (_init_critics already passes the SAME encoder=self.encoder_critic to
+    both CriticEnsemble instances, confirmed by reading that method
+    directly). Attaching the same nn.Module instance as a plain attribute
+    on both auto-registers it as a submodule of each (nn.Module.__setattr__),
+    so optimizer_critic = Adam(critic_ensemble.parameters()) already
+    includes it with zero further wiring, and update_target_networks()'s
+    `zip(critic_target.parameters(), critic_ensemble.parameters(),
+    strict=True)` sees the exact same tensors on both sides (Polyak-
+    blending a tensor with itself is an exact no-op at any weight), so
+    there is no target-lag concern and no strict=True count mismatch.
+
+    Loading an existing checkpoint trained WITHOUT this patch (e.g.
+    bc_grasp_place_v2) hits a real shape mismatch on the critic's first
+    layer (input_dim changed) -- PyTorch's load_state_dict raises on a
+    shape mismatch for a key present on both sides regardless of
+    strict=False (that flag only tolerates missing/extra keys, confirmed
+    by reading safetensors.torch.load_model() and torch's own
+    load_state_dict directly). patch_sac_tolerates_shape_mismatch_on_load()
+    below makes this a warn-and-skip instead of a crash -- everything
+    that still matches shape (encoder, actor entirely, critic's later
+    layers) loads normally; only the critic's first layer + the new
+    action_embed start fresh/random.
+    """
+    import os as _os
+
+    import torch as _torch
+    import torch.nn as _nn
+
+    from lerobot.policies.sac.modeling_sac import CriticEnsemble, CriticHead, SACPolicy
+
+    embed_dim = int(_os.environ.get("HILSERL_CRITIC_ACTION_EMBED_DIM", "0"))
+    if embed_dim <= 0:
+        return
+
+    if not getattr(CriticEnsemble, "_anvil_action_embed_forward_patched", False):
+        CriticEnsemble._anvil_action_embed_forward_patched = True
+        orig_forward = CriticEnsemble.forward
+
+        def _forward(self, observations, actions, observation_features=None):
+            embed = getattr(self, "action_embed", None)
+            if embed is not None:
+                actions = embed(actions)
+            return orig_forward(self, observations, actions, observation_features=observation_features)
+
+        CriticEnsemble.forward = _forward
+
+    if getattr(SACPolicy, "_anvil_critic_action_embed_init_patched", False):
+        return
+    SACPolicy._anvil_critic_action_embed_init_patched = True
+
+    from dataclasses import asdict as _asdict
+
+    def _init_critics(self, continuous_action_dim):
+        action_embed = _nn.Sequential(_nn.Linear(continuous_action_dim, embed_dim), _nn.SiLU())
+
+        heads = [
+            CriticHead(
+                input_dim=self.encoder_critic.output_dim + embed_dim,
+                **_asdict(self.config.critic_network_kwargs),
+            )
+            for _ in range(self.config.num_critics)
+        ]
+        self.critic_ensemble = CriticEnsemble(encoder=self.encoder_critic, ensemble=heads)
+        self.critic_ensemble.action_embed = action_embed  # auto-registers as a submodule
+
+        target_heads = [
+            CriticHead(
+                input_dim=self.encoder_critic.output_dim + embed_dim,
+                **_asdict(self.config.critic_network_kwargs),
+            )
+            for _ in range(self.config.num_critics)
+        ]
+        self.critic_target = CriticEnsemble(encoder=self.encoder_critic, ensemble=target_heads)
+        # Attach BEFORE load_state_dict, not after -- critic_ensemble's
+        # state_dict() already has action_embed's keys (attached above),
+        # so critic_target needs the same submodule present first or the
+        # sync raises "Unexpected key(s): action_embed.0.weight/.bias".
+        self.critic_target.action_embed = action_embed  # SAME object, not a copy -- see docstring
+        self.critic_target.load_state_dict(self.critic_ensemble.state_dict())
+
+        if self.config.use_torch_compile:
+            self.critic_ensemble = _torch.compile(self.critic_ensemble)
+            self.critic_target = _torch.compile(self.critic_target)
+
+        if self.config.num_discrete_actions is not None:
+            self._init_discrete_critics()
+
+    SACPolicy._init_critics = _init_critics
+
+    print(f"[LEARNER-DBG] critic action-embedding enabled (HILSERL_CRITIC_ACTION_EMBED_DIM={embed_dim}) "
+          "-- action now gets its own learned embedding before concatenation with the encoder output.",
+          flush=True)
+
+    patch_sac_tolerates_shape_mismatch_on_load()
+
+
+def patch_sac_tolerates_shape_mismatch_on_load() -> None:
+    """Companion to patch_sac_critic_action_embedding() -- see that
+    function's docstring for why a shape mismatch is EXPECTED when loading
+    a checkpoint trained before the action-embedding change, and why
+    strict=False alone doesn't help (PyTorch's load_state_dict raises on a
+    shape mismatch for a key present on both sides regardless of that
+    flag -- confirmed by reading safetensors.torch.load_model() and
+    load_state_dict directly, not assumed).
+
+    Fix: replace SACPolicy._load_as_safetensor (classmethod) with a
+    version that reads the raw tensors (same safetensors.torch.load_file()
+    call the stock path uses internally), filters out any key whose saved
+    shape doesn't match the freshly-constructed model's own parameter
+    shape, loads the rest via the model's normal load_state_dict(...,
+    strict=False), and logs exactly which keys were skipped. Only called
+    by patch_sac_critic_action_embedding() when that feature is actually
+    on -- not registered standalone in apply_all_patches(), since it has
+    no reason to exist when every shape already matches.
+    """
+    from lerobot.policies.sac.modeling_sac import SACPolicy
+
+    if getattr(SACPolicy, "_anvil_shape_mismatch_tolerant_load_patched", False):
+        return
+    SACPolicy._anvil_shape_mismatch_tolerant_load_patched = True
+
+    import packaging.version
+    import safetensors
+    from safetensors.torch import load_file
+
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file, map_location, strict):
+        kwargs = {}
+        if packaging.version.parse(safetensors.__version__) >= packaging.version.parse("0.4.3"):
+            kwargs["device"] = map_location
+        saved_state_dict = load_file(model_file, **kwargs)
+        model_state_dict = model.state_dict()
+
+        skipped = []
+        for key in list(saved_state_dict.keys()):
+            if key in model_state_dict and saved_state_dict[key].shape != model_state_dict[key].shape:
+                skipped.append(
+                    f"{key}: saved {tuple(saved_state_dict[key].shape)} != "
+                    f"model {tuple(model_state_dict[key].shape)}"
+                )
+                del saved_state_dict[key]
+
+        if skipped:
+            print(
+                f"[LEARNER-DBG] loading checkpoint with {len(skipped)} shape-mismatched key(s) "
+                "skipped (expected when loading a pre-action-embedding checkpoint under "
+                "HILSERL_CRITIC_ACTION_EMBED_DIM -- these start fresh/random instead):",
+                flush=True,
+            )
+            for s in skipped:
+                print(f"  {s}", flush=True)
+
+        model.load_state_dict(saved_state_dict, strict=False)
+        return model
+
+    SACPolicy._load_as_safetensor = _load_as_safetensor
+
+
 def patch_sac_actor_warmup() -> None:
     """First real-RL session (2026-09-29, BC v8 -> RL, 1500 steps,
     online_step_before_learning=10): the policy came back measurably WORSE
@@ -1475,6 +1680,7 @@ def apply_all_patches() -> None:
     patch_sac_normalizes_replay_buffer_actions_for_critic_loss()
     patch_sac_checkpoints_carry_action_bounds()
     patch_sac_freeze_temperature()
+    patch_sac_critic_action_embedding()
     patch_sac_actor_warmup()
     patch_learner_episode_stats_logging()
     patch_robot_env_step_keeps_intervention_flag()
