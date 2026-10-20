@@ -15,8 +15,8 @@
 # exact leaf).
 #
 # Usage:
-#   ./scripts/run_hilserl_bimanual.sh learner [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--actor-warmup-steps N]
-#   ./scripts/run_hilserl_bimanual.sh actor   [--online-steps N] [--run-name NAME] [--resume]
+#   ./scripts/run_hilserl_bimanual.sh learner [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--actor-warmup-steps N] [--critic-action-embed-dim N]
+#   ./scripts/run_hilserl_bimanual.sh actor   [--online-steps N] [--run-name NAME] [--resume] [--critic-action-embed-dim N]
 #   ./scripts/run_hilserl_bimanual.sh stop
 #   ./scripts/run_hilserl_bimanual.sh prune   [--run-name NAME] [--keep N]
 #
@@ -80,7 +80,7 @@ set -euo pipefail
 MODE="${1:-}"
 shift || true
 if [[ "$MODE" != "learner" && "$MODE" != "actor" && "$MODE" != "stop" && "$MODE" != "prune" ]]; then
-    echo "Usage: $0 {learner|actor|stop|prune} [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--keep N] [--actor-warmup-steps N]" >&2
+    echo "Usage: $0 {learner|actor|stop|prune} [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--keep N] [--actor-warmup-steps N] [--critic-action-embed-dim N]" >&2
     exit 1
 fi
 
@@ -90,6 +90,18 @@ RUN_NAME=""
 RESUME=false
 KEEP=1
 ACTOR_WARMUP_STEPS=0
+# Default 0 (off, byte-for-byte original critic architecture) --
+# --critic-action-embed-dim N (both learner AND actor, unlike
+# --actor-warmup-steps which is learner-only) applies
+# patch_sac_critic_action_embedding(): gives the action its own learned
+# embedding before concatenation with the encoder output, instead of raw
+# concatenation. MUST be passed identically to both processes -- both
+# construct a full SACPolicy (the actor for inference too), and a
+# mismatched value between them means the actor would try to load a
+# checkpoint shaped for one architecture into the other with no
+# shape-tolerant loader installed (that loader is only wired up when this
+# value is >0), i.e. a hard crash rather than a silent mismatch.
+CRITIC_ACTION_EMBED_DIM=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --online-steps) ONLINE_STEPS="$2"; shift 2 ;;
@@ -98,6 +110,7 @@ while [[ $# -gt 0 ]]; do
         --resume) RESUME=true; shift ;;
         --keep) KEEP="$2"; shift 2 ;;
         --actor-warmup-steps) ACTOR_WARMUP_STEPS="$2"; shift 2 ;;
+        --critic-action-embed-dim) CRITIC_ACTION_EMBED_DIM="$2"; shift 2 ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -333,6 +346,7 @@ if [[ "$MODE" == "learner" ]]; then
     # backgrounded shell job left for anything to reach anymore.
     CONTAINER_ID="$(docker run -d "${COMMON_ARGS[@]}" \
         -e HILSERL_ACTOR_WARMUP_STEPS="$ACTOR_WARMUP_STEPS" \
+        -e HILSERL_CRITIC_ACTION_EMBED_DIM="$CRITIC_ACTION_EMBED_DIM" \
         "$IMAGE" \
         bash -c ". /opt/ros/jazzy/setup.sh && . /workspace/install/setup.sh && ros2 run lerobot_control hilserl_learner --config_path=$CONFIG_CONTAINER_PATH --output_dir=/workspace/outputs/learner --policy.online_steps=$LEARNER_ONLINE_STEPS --save_freq=$SAVE_FREQ $RESUME_ARG")"
     echo "[run_hilserl_bimanual] container $CONTAINER_ID started, waiting for it to be genuinely ready..."
@@ -401,6 +415,7 @@ else
     echo "[run_hilserl_bimanual] actor -- run_name=$RUN_NAME online_steps=$ONLINE_STEPS resume=$RESUME run_dir=$RUN_DIR"
     echo "[run_hilserl_bimanual] needs a real TTY for keyboard intervention -- running interactively."
     exec docker run -it "${COMMON_ARGS[@]}" \
+        -e HILSERL_CRITIC_ACTION_EMBED_DIM="$CRITIC_ACTION_EMBED_DIM" \
         "$IMAGE" \
         bash -c ". /opt/ros/jazzy/setup.sh && . /workspace/install/setup.sh && ros2 run lerobot_control hilserl_actor --config_path=$CONFIG_CONTAINER_PATH --output_dir=/workspace/outputs/$ACTOR_OUTPUT_SUBDIR --policy.online_steps=$ONLINE_STEPS $PRETRAINED_ARG"
 fi
