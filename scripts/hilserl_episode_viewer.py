@@ -39,6 +39,155 @@ except Exception:
 
 
 # --------------------------------------------------------------------------
+# forward-kinematics skeleton pane (bimanual push-bottle jointspace task)
+# --------------------------------------------------------------------------
+#
+# state_deg / action layout for this task is 16-dim, LEFT-then-RIGHT, each
+# arm contributing its own 8-wide block of [joint1..joint7 (deg), gripper
+# (raw meters, NOT degrees -- finger_joint1 is prismatic)]:
+#
+#   [follower_l_joint1..7, follower_l_gripper, follower_r_joint1..7, follower_r_gripper]
+#
+# Confirmed via:
+#   - configs/hilserl/env_push_bottle_bimanual_jointspace.yaml's `arms:` list
+#     (follower_l entry before follower_r) and its header comment:
+#     "LEFT-then-RIGHT 16-dim state/action: [7 left joints, left gripper,
+#     7 right joints, right gripper]".
+#   - ros2/src/.../hilserl/robot_anvil_openarm.py:159
+#     (`self.joint_names = [f"{ros_prefix}_joint{i}" for i in range(1, num_joints+1)]`)
+#     and :185-188 (bus_motor_names = joint_names, then gripper joint
+#     appended at the end IFF use_gripper) -- so each arm's own 8-wide
+#     block is [joint1..joint7, gripper], gripper last.
+#   - ros2/src/.../hilserl/robot_anvil_openarm_multi.py:112-141
+#     (AnvilOpenArmMultiFollower.__init__ concatenates arm_bus_names for
+#     each arm in `config.arms` list order into self.joint_names, which
+#     RobotEnv/get_observation() follow directly) -- so the overall vector
+#     is arm-blocks concatenated in config.arms list order, i.e. left
+#     block then right block given the yaml's declared order above.
+#   - robot_anvil_openarm.py:589 (`obs[f"{j}.pos"] = float(np.rad2deg(...))`
+#     for the 7 revolute joints) and :597 ("Raw meters, NOT rad2deg --
+#     finger_joint1 is prismatic") confirm per-dimension units: the 14 arm
+#     joints are in degrees (hence "state_deg"), the 2 gripper dims are in
+#     raw meters, 0.0-0.05m range.
+_ARM_PREFIXES = ("follower_l", "follower_r")
+_N_ARM_JOINTS = 7
+_ARM_BLOCK_WIDTH = _N_ARM_JOINTS + 1  # 7 joints + 1 gripper, per arm
+_ARM_COLORS = {"follower_l": "#5fd3ff", "follower_r": "#ffb15f"}
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_URDF_PATH = os.path.join(
+    _REPO_ROOT, "configs", "hilserl", "urdf", "openarm_teleop_kinematics.urdf"
+)
+
+
+def _try_import_placo():
+    """placo (the same FK/IK library this project already uses via
+    lerobot.model.kinematics.RobotKinematics, see
+    ros2/src/.../hilserl/live_ee_position.py) is a compiled C++ extension
+    with Python bindings. It's directly importable in the host .venv here
+    (confirmed: no Docker/ROS2/rclpy needed) -- so we use it directly for
+    FK rather than shelling out to the hilserl-test Docker image or
+    hand-rolling a custom URDF-chain FK implementation."""
+    try:
+        import placo  # type: ignore[import-not-found]
+
+        return placo
+    except Exception:
+        return None
+
+
+def _fk_chain_names(prefix: str) -> list[str]:
+    """Frame names for one arm's chain, base to tip: link0..link7, then the
+    fixed hand_tcp frame (confirmed present in the URDF for both follower
+    arms, independent of gripper/finger joint values -- see
+    configs/hilserl/urdf/openarm_teleop_kinematics.urdf's
+    follower_{l,r}_hand_tcp_joint, a fixed joint off of follower_{l,r}_hand,
+    itself fixed off link7; finger joints only affect the two finger links,
+    not hand_tcp)."""
+    return [f"{prefix}_link{i}" for i in range(_N_ARM_JOINTS + 1)] + [f"{prefix}_hand_tcp"]
+
+
+def compute_fk_positions(state: np.ndarray, urdf_path: str = DEFAULT_URDF_PATH) -> dict[str, np.ndarray] | None:
+    """FK over every frame of one episode's state_deg (N,16) array.
+
+    Returns {"follower_l": (N, 9, 3), "follower_r": (N, 9, 3)} world-frame
+    xyz (meters) for each arm's link0..link7 + hand_tcp chain, or None if
+    placo isn't importable or the state array doesn't look like the
+    16-dim bimanual layout this function assumes.
+    """
+    placo = _try_import_placo()
+    if placo is None:
+        return None
+    if state.ndim != 2 or state.shape[1] < 2 * _ARM_BLOCK_WIDTH:
+        return None
+    if not os.path.isfile(urdf_path):
+        return None
+
+    robot = placo.RobotWrapper(urdf_path)
+    chains = {p: _fk_chain_names(p) for p in _ARM_PREFIXES}
+    n = state.shape[0]
+    out = {p: np.zeros((n, len(chains[p]), 3), dtype=np.float32) for p in _ARM_PREFIXES}
+
+    for t in range(n):
+        for i in range(_N_ARM_JOINTS):
+            left_deg = float(state[t, i])
+            right_deg = float(state[t, _ARM_BLOCK_WIDTH + i])
+            robot.set_joint(f"follower_l_joint{i + 1}", float(np.deg2rad(left_deg)))
+            robot.set_joint(f"follower_r_joint{i + 1}", float(np.deg2rad(right_deg)))
+        robot.update_kinematics()
+        for p in _ARM_PREFIXES:
+            for i, frame_name in enumerate(chains[p]):
+                out[p][t, i] = robot.get_T_world_frame(frame_name)[:3, 3]
+
+    return out
+
+
+def render_skeleton_frames(fk: dict[str, np.ndarray], dpi: int = 92, figsize: tuple[float, float] = (2.6, 2.6)) -> list[str]:
+    """Render each frame's two-arm stick-figure skeleton (FK output) as a
+    small PNG data URI, one fixed oblique 3D viewing angle, axis limits
+    held constant across the whole episode (computed once from the global
+    min/max over every frame) so the pane doesn't rescale/jitter frame to
+    frame -- only the arms themselves should appear to move."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = next(iter(fk.values())).shape[0]
+    all_pts = np.concatenate([arr.reshape(-1, 3) for arr in fk.values()], axis=0)
+    center = all_pts.mean(axis=0)
+    radius = float(np.max(np.abs(all_pts - center))) * 1.15 + 1e-3
+
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    fig.patch.set_facecolor("#11131a")
+    ax = fig.add_subplot(111, projection="3d")
+
+    data_uris: list[str] = []
+    for t in range(n):
+        ax.clear()
+        ax.set_facecolor("#11131a")
+        for p in _ARM_PREFIXES:
+            pts = fk[p][t]
+            ax.plot(
+                pts[:, 0], pts[:, 1], pts[:, 2],
+                "-o", markersize=3, linewidth=1.8, color=_ARM_COLORS[p], label=p,
+            )
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+        ax.set_zlim(center[2] - radius, center[2] + radius)
+        ax.view_init(elev=18, azim=-60)
+        ax.set_axis_off()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", facecolor="#11131a")
+        buf.seek(0)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        data_uris.append(f"data:image/png;base64,{b64}")
+
+    plt.close(fig)
+    return data_uris
+
+
+# --------------------------------------------------------------------------
 # npz loading
 # --------------------------------------------------------------------------
 
@@ -210,6 +359,15 @@ h1 { font-size: 18px; margin: 0 0 12px 0; }
   background: #000; border: 1px solid #333; border-radius: 4px;
 }
 .cam-box .cam-label { font-size: 11px; color: #9aa3b2; margin-top: 2px; }
+.skel-box { text-align: center; margin-bottom: 10px; }
+.skel-box img {
+  width: 234px; height: 234px; display: block; background: #11131a;
+  border: 1px solid #333; border-radius: 4px; margin: 0 auto;
+}
+.skel-box .skel-label { font-size: 11px; color: #9aa3b2; margin-top: 2px; }
+.skel-legend { display: flex; justify-content: center; gap: 14px; margin-top: 4px; font-size: 10px; color: #c3c9d4; }
+.skel-legend .chip { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 3px; vertical-align: middle; }
+.skel-unavailable { font-size: 11px; color: #e2a65f; padding: 10px; text-align: center; }
 .chart-block { margin-bottom: 10px; }
 .chart-title { font-size: 11px; color: #9aa3b2; margin-bottom: 2px; }
 .chart-wrap { position: relative; width: 100%; }
@@ -319,6 +477,7 @@ function setupEpisode(epId) {
   data.camera_names.forEach(cam => {
     camImgs[cam] = document.getElementById("img-" + epId + "-" + cam);
   });
+  const skelImg = document.getElementById("skel-" + epId);
   const cursors = [
     document.getElementById("cursor-action-" + epId),
     document.getElementById("cursor-state-" + epId),
@@ -356,6 +515,9 @@ function setupEpisode(epId) {
       const img = camImgs[cam];
       if (img) img.src = data.images[cam][frameIdx];
     });
+    if (skelImg && data.skeleton_available) {
+      skelImg.src = data.skeleton_images[frameIdx];
+    }
     frameLabel.textContent = "Frame " + frameIdx + " / " + (n - 1);
     slider.value = frameIdx;
     const frac = n > 1 ? frameIdx / (n - 1) : 0;
@@ -419,7 +581,13 @@ def _stat_rows(stats: dict[str, Any]) -> list[tuple[str, str, str]]:
     return rows
 
 
-def render_episode_html(ep: dict[str, Any], ep_id: str, jpeg_quality: int) -> tuple[str, str]:
+def render_episode_html(
+    ep: dict[str, Any],
+    ep_id: str,
+    jpeg_quality: int,
+    skeleton_images: list[str] | None = None,
+    skeleton_error: str | None = None,
+) -> tuple[str, str]:
     """Returns (html_fragment, json_data_script)."""
     n = ep["n_steps"]
     stats = ep["stats"]
@@ -437,6 +605,8 @@ def render_episode_html(ep: dict[str, Any], ep_id: str, jpeg_quality: int) -> tu
         "done": ep["done"].tolist(),
         "is_intervention": ep["is_intervention"].tolist(),
         "images": images,
+        "skeleton_available": skeleton_images is not None,
+        "skeleton_images": skeleton_images or [],
     }
     data_json = json.dumps(data_payload)
 
@@ -451,6 +621,20 @@ def render_episode_html(ep: dict[str, Any], ep_id: str, jpeg_quality: int) -> tu
     )
     if not cam_html:
         cam_html = '<div class="cam-box"><div class="cam-label">no camera arrays found</div></div>'
+
+    if skeleton_images is not None:
+        skel_html = f"""
+        <div class="skel-box">
+          <img id="skel-{ep_id}" alt="FK skeleton">
+          <div class="skel-label">FK skeleton (both arms, from state_deg)</div>
+          <div class="skel-legend">
+            <span><span class="chip" style="background:{_ARM_COLORS["follower_l"]}"></span>follower_l</span>
+            <span><span class="chip" style="background:{_ARM_COLORS["follower_r"]}"></span>follower_r</span>
+          </div>
+        </div>"""
+    else:
+        reason = skeleton_error or "skeleton disabled"
+        skel_html = f'<div class="skel-box"><div class="skel-unavailable">FK skeleton unavailable: {reason}</div></div>'
 
     def chart_block(title: str, chart_key: str) -> str:
         return f"""
@@ -476,6 +660,7 @@ def render_episode_html(ep: dict[str, Any], ep_id: str, jpeg_quality: int) -> tu
       </div>
       <div class="readout" id="readout-{ep_id}"></div>
       <div class="cams">{cam_html}</div>
+      {skel_html}
       {chart_block("Action (all dims, each line min/max-normalized)", "action")}
       {chart_block("State (deg, all dims, each line min/max-normalized)", "state")}
       {chart_block("Reward / Done", "reward")}
@@ -486,12 +671,18 @@ def render_episode_html(ep: dict[str, Any], ep_id: str, jpeg_quality: int) -> tu
     return fragment, data_script
 
 
-def build_html(episodes: list[dict[str, Any]], jpeg_quality: int) -> str:
+def build_html(
+    episodes: list[dict[str, Any]],
+    jpeg_quality: int,
+    skeleton_results: list[tuple[list[str] | None, str | None]] | None = None,
+) -> str:
     ep_ids = [f"ep{i}" for i in range(len(episodes))]
+    if skeleton_results is None:
+        skeleton_results = [(None, "skeleton disabled (--no-skeleton)")] * len(episodes)
     fragments = []
     data_scripts = []
-    for ep, ep_id in zip(episodes, ep_ids):
-        frag, data_script = render_episode_html(ep, ep_id, jpeg_quality)
+    for ep, ep_id, (skel_images, skel_error) in zip(episodes, ep_ids, skeleton_results):
+        frag, data_script = render_episode_html(ep, ep_id, jpeg_quality, skel_images, skel_error)
         fragments.append(frag)
         data_scripts.append(data_script)
 
@@ -539,6 +730,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--jpeg-quality", type=int, default=80, help="JPEG quality for embedded frames (1-95, default 80). Ignored if Pillow is unavailable (falls back to PNG)."
     )
+    parser.add_argument(
+        "--skeleton",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Include a forward-kinematics stick-figure skeleton pane per episode, computed from "
+            "state_deg via placo FK against the project's openarm_teleop_kinematics.urdf (default: "
+            "on; FK itself is fast but per-frame matplotlib rendering adds ~5-15ms/frame -- use "
+            "--no-skeleton to skip it, e.g. for quick iteration on other parts of the viewer)."
+        ),
+    )
+    parser.add_argument(
+        "--urdf-path",
+        default=DEFAULT_URDF_PATH,
+        help=f"URDF used for the FK skeleton pane (default: {DEFAULT_URDF_PATH}).",
+    )
     args = parser.parse_args(argv)
 
     episodes = []
@@ -555,7 +762,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         episodes.append(ep)
 
-    html = build_html(episodes, jpeg_quality=args.jpeg_quality)
+    skeleton_results: list[tuple[list[str] | None, str | None]] = []
+    if args.skeleton:
+        for ep in episodes:
+            print(f"Computing FK skeleton for {ep['basename']} ...", file=sys.stderr)
+            fk = compute_fk_positions(ep["state"], urdf_path=args.urdf_path)
+            if fk is None:
+                msg = (
+                    "placo not importable"
+                    if _try_import_placo() is None
+                    else f"state_dim={ep['stats']['state_dim']} (need 16-dim bimanual layout) or URDF not found"
+                )
+                print(f"  skeleton skipped: {msg}", file=sys.stderr)
+                skeleton_results.append((None, msg))
+                continue
+            images = render_skeleton_frames(fk)
+            print(f"  rendered {len(images)} skeleton frames", file=sys.stderr)
+            skeleton_results.append((images, None))
+    else:
+        skeleton_results = [(None, "skeleton disabled (--no-skeleton)")] * len(episodes)
+
+    html = build_html(episodes, jpeg_quality=args.jpeg_quality, skeleton_results=skeleton_results)
 
     with open(args.output, "w") as f:
         f.write(html)
