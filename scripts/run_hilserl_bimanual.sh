@@ -15,7 +15,7 @@
 # exact leaf).
 #
 # Usage:
-#   ./scripts/run_hilserl_bimanual.sh learner [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--actor-warmup-steps N] [--critic-action-embed-dim N]
+#   ./scripts/run_hilserl_bimanual.sh learner [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--actor-warmup-steps N] [--critic-action-embed-dim N] [--actor-bc-anchor-weight W]
 #   ./scripts/run_hilserl_bimanual.sh actor   [--online-steps N] [--run-name NAME] [--resume] [--critic-action-embed-dim N]
 #   ./scripts/run_hilserl_bimanual.sh stop
 #   ./scripts/run_hilserl_bimanual.sh prune   [--run-name NAME] [--keep N]
@@ -40,6 +40,26 @@
 # project's own earlier single-arm diagnosis of the same symptom. Off by
 # default since this exact lever has never been validated before; try
 # --actor-warmup-steps 200 as a starting point and adjust from there.
+#
+# --actor-bc-anchor-weight W (learner only, default off): adds
+# W * MSE(actor_output, executed_action) to the actor loss, via patches.py's
+# patch_sac_actor_bc_anchor() (HILSERL_ACTOR_BC_ANCHOR_WEIGHT env var).
+# Confirmed directly from run 20261020's 4 real episodes, 2026-10-21: the
+# actor's own deterministic output collapsed 10-20x in per-dim std between
+# episode 2 and 3 across every action dim -- not tanh saturation (no dim's
+# normalized mean exceeds |0.95|), not the robot getting physically stuck
+# (step-to-step state motion stayed 6-8 deg/step throughout). It learned
+# coarse task-progress tracking (critic's across-state Q-variance grew 16x
+# over training) but lost fine, local state-reactivity, since the sparse/
+# terminal reward never gives the critic a local action-sensitivity signal
+# to pass on, and the frozen-near-zero temperature (patch_sac_freeze_
+# temperature(), needed for a different problem) removes the entropy term
+# that would otherwise resist this kind of collapse. This anchor term
+# directly penalizes diverging from real executed (demo/intervention)
+# actions, independent of whether the critic ever becomes better
+# calibrated. Off by default since this lever has never been validated on
+# real hardware before; try --actor-bc-anchor-weight 1.0 as a starting
+# point and adjust from there.
 #
 # Start the learner first in one terminal; once it reports serving gRPC,
 # start the actor in a SECOND terminal (needs a real TTY for keyboard
@@ -80,7 +100,7 @@ set -euo pipefail
 MODE="${1:-}"
 shift || true
 if [[ "$MODE" != "learner" && "$MODE" != "actor" && "$MODE" != "stop" && "$MODE" != "prune" ]]; then
-    echo "Usage: $0 {learner|actor|stop|prune} [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--keep N] [--actor-warmup-steps N] [--critic-action-embed-dim N]" >&2
+    echo "Usage: $0 {learner|actor|stop|prune} [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--keep N] [--actor-warmup-steps N] [--critic-action-embed-dim N] [--actor-bc-anchor-weight W]" >&2
     exit 1
 fi
 
@@ -90,6 +110,7 @@ RUN_NAME=""
 RESUME=false
 KEEP=1
 ACTOR_WARMUP_STEPS=0
+ACTOR_BC_ANCHOR_WEIGHT=0.0
 # Default 0 (off, byte-for-byte original critic architecture) --
 # --critic-action-embed-dim N (both learner AND actor, unlike
 # --actor-warmup-steps which is learner-only) applies
@@ -110,6 +131,7 @@ while [[ $# -gt 0 ]]; do
         --resume) RESUME=true; shift ;;
         --keep) KEEP="$2"; shift 2 ;;
         --actor-warmup-steps) ACTOR_WARMUP_STEPS="$2"; shift 2 ;;
+        --actor-bc-anchor-weight) ACTOR_BC_ANCHOR_WEIGHT="$2"; shift 2 ;;
         --critic-action-embed-dim) CRITIC_ACTION_EMBED_DIM="$2"; shift 2 ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -335,7 +357,7 @@ if [[ "$MODE" == "learner" ]]; then
     fi
     LEARNER_ONLINE_STEPS=$((CURRENT_STEP + ONLINE_STEPS))
 
-    echo "[run_hilserl_bimanual] learner -- run_name=$RUN_NAME current_step=$CURRENT_STEP +$ONLINE_STEPS -> online_steps=$LEARNER_ONLINE_STEPS save_freq=$SAVE_FREQ resume=$RESUME actor_warmup_steps=$ACTOR_WARMUP_STEPS run_dir=$RUN_DIR"
+    echo "[run_hilserl_bimanual] learner -- run_name=$RUN_NAME current_step=$CURRENT_STEP +$ONLINE_STEPS -> online_steps=$LEARNER_ONLINE_STEPS save_freq=$SAVE_FREQ resume=$RESUME actor_warmup_steps=$ACTOR_WARMUP_STEPS actor_bc_anchor_weight=$ACTOR_BC_ANCHOR_WEIGHT run_dir=$RUN_DIR"
 
     # Runs detached (-d) rather than via setsid/nohup/disown -- Docker's own
     # daemon owns the container's lifecycle this way, completely independent
@@ -347,6 +369,7 @@ if [[ "$MODE" == "learner" ]]; then
     CONTAINER_ID="$(docker run -d "${COMMON_ARGS[@]}" \
         -e HILSERL_ACTOR_WARMUP_STEPS="$ACTOR_WARMUP_STEPS" \
         -e HILSERL_CRITIC_ACTION_EMBED_DIM="$CRITIC_ACTION_EMBED_DIM" \
+        -e HILSERL_ACTOR_BC_ANCHOR_WEIGHT="$ACTOR_BC_ANCHOR_WEIGHT" \
         "$IMAGE" \
         bash -c ". /opt/ros/jazzy/setup.sh && . /workspace/install/setup.sh && ros2 run lerobot_control hilserl_learner --config_path=$CONFIG_CONTAINER_PATH --output_dir=/workspace/outputs/learner --policy.online_steps=$LEARNER_ONLINE_STEPS --save_freq=$SAVE_FREQ $RESUME_ARG")"
     echo "[run_hilserl_bimanual] container $CONTAINER_ID started, waiting for it to be genuinely ready..."

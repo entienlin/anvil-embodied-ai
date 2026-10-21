@@ -46,6 +46,18 @@ re-deriving it live during an active debugging session.
       compute_loss_critic() mixed raw-degree replay-buffer actions with
       the actor's own tanh-bounded (-1,1) samples -- a TD-learning
       scale-mismatch that corrupted the critic for joint-space actions.
+  2026-10-21  patch_sac_actor_bc_anchor
+      Measured directly from 4 real episodes: the actor's own output
+      collapsed 10-20x in per-dim std between episode 2 and 3 (not tanh
+      saturation, not the robot getting stuck) -- it learned coarse
+      task-progress tracking but lost fine, local state-reactivity,
+      since the sparse/delayed reward never gives the critic a local
+      action-sensitivity signal to pass on, and frozen temperature
+      removes the entropy term that would otherwise resist this kind of
+      collapse. Opt-in (HILSERL_ACTOR_BC_ANCHOR_WEIGHT) TD3+BC-style
+      MSE(actor_output, executed_action) anchor term on the actor loss --
+      penalizes collapsing toward a state-invariant output directly,
+      independent of whether the critic ever becomes better calibrated.
   2026-10-01  patch_sac_checkpoints_carry_action_bounds
       Periodic RL checkpoint saves never copied action_bounds.json
       forward -- would silently reintroduce the de-norm bug for any
@@ -790,6 +802,131 @@ def patch_sac_normalizes_replay_buffer_actions_for_critic_loss() -> None:
             half = self._anvil_action_half.to(batch[ACTION].device)
             batch[ACTION] = (batch[ACTION] - mid.to(batch[ACTION].device)) / half
         return orig_forward(self, batch, model=model)
+
+    SACPolicy.forward = _forward
+
+
+def patch_sac_actor_bc_anchor() -> None:
+    """Real finding (2026-10-21, gripper task, run 20261020): directly
+    measuring four consecutive real episodes' saved actor_trajectories
+    showed the policy's own (deterministic) action output collapsed
+    10-20x in per-dimension std between episode 2 and episode 3 (e.g.
+    0.10-0.46 normalized std down to 0.006-0.037), across every one of the
+    16 action dims, NOT caused by tanh-boundary saturation (no dimension's
+    mean exceeds |0.95| normalized) and NOT caused by the robot getting
+    physically stuck (step-to-step state motion stayed 6-8 deg/step,
+    unchanged across all 4 episodes). Re-measured with the offline
+    Q-variance diagnostic across this run's own checkpoints (100-900):
+    across-STATE critic variance grew 16x over training (0.0125 -> 0.20),
+    while action-induced variance barely grew (0.000013 -> 0.000027) --
+    and feeding the SAME fixed, diverse 40-state sample through each
+    checkpoint showed the actor's deterministic output std RISING
+    (0.024 -> 0.125), not collapsing.
+
+    Reconciling all four facts: the actor has learned coarse task-progress
+    tracking (states far apart in the overall trajectory get correctly
+    different outputs -- consistent with the critic's easily-learned,
+    heavily-reinforced "how far along am I" signal from the sparse
+    terminal reward) but has NOT learned fine, LOCAL state-to-action
+    reactivity -- within the narrow neighborhood of states actually
+    visited inside one real closed-loop episode, the output is nearly
+    constant regardless of the real (and substantial) state variation
+    happening there. compute_loss_actor()'s only improvement signal is
+    `-min_Q(s, pi(s))`'s gradient w.r.t. actor params, i.e. the LOCAL
+    slope of Q in action-space at whatever state the actor is currently
+    at -- and that local slope is exactly what the action-blind critic
+    has never learned (sparse/delayed reward rewards state-progress, not
+    fine per-step action choices). With temperature frozen near-zero
+    (patch_sac_freeze_temperature(), needed to stop a DIFFERENT real
+    problem -- noise re-inflation -- the entropy term that would normally
+    resist this kind of over-concentration is almost fully neutered too.
+    Net effect: nothing in the current training signal rewards retaining
+    local, state-appropriate variation, so the actor is free to collapse
+    toward whatever locally-flat-Q output it happens to settle on.
+
+    Fix: TD3+BC/RLPD-style explicit anchor -- add
+    `HILSERL_ACTOR_BC_ANCHOR_WEIGHT * MSE(actor_output, executed_action)`
+    to the actor loss. `executed_action` is literally whatever a real
+    human (BC demo or live intervention) or the policy itself actually
+    did -- real executed trajectories, by construction, vary locally with
+    state (a human reaching for a moving target doesn't output a constant
+    joint command). Penalizing divergence from that diversity directly
+    opposes collapse toward a state-invariant output, regardless of how
+    flat the critic's own local gradient is -- it does not depend on the
+    critic ever becoming better calibrated. Deliberately anchors against
+    the FULL batch (mixed online+offline, exactly what forward() already
+    receives for model="actor") rather than carving out an offline-only
+    sub-batch: simpler, doesn't depend on learner.py's internal
+    online/offline concatenation order, and still directly opposes the
+    diagnosed pathology, since ANY batch containing real, state-varying
+    executed actions penalizes a collapsed-constant output -- a purer
+    offline-only version is a possible future refinement, not required to
+    address what was actually measured.
+
+    Opt-in via HILSERL_ACTOR_BC_ANCHOR_WEIGHT (default "0.0" = off, i.e.
+    today's unmodified behavior -- untested at any nonzero value yet).
+    compute_loss_actor() gains an optional demo_actions=None kwarg
+    (backward compatible -- only patch_sac_actor_bc_anchor() ever passes
+    it). SACPolicy.forward()'s model=="actor" branch is replaced to
+    extract batch[ACTION] and normalize it into the actor's own (-1,1)
+    tanh-bounded scale using self._anvil_action_mid/_anvil_action_half
+    (attached by patch_sac_loads_action_bounds_on_from_pretrained()) --
+    the SAME bounds/attributes patch_sac_normalizes_replay_buffer_actions_
+    for_critic_loss() uses for the critic path, so this is correct
+    regardless of that patch's registration order relative to this one
+    (deliberately re-derives the normalization from batch[ACTION] itself
+    rather than relying on reading that other patch's mutated value).
+    No-op scale-wise (demo_actions passed through unnormalized) for
+    checkpoints with no action_bounds.json (e.g. the original ee_delta
+    task, whose action space is already (-1,1)-scale by construction).
+    """
+    from lerobot.policies.sac.modeling_sac import ACTION, SACPolicy
+
+    if getattr(SACPolicy, "_anvil_actor_bc_anchor_patched", False):
+        return
+    SACPolicy._anvil_actor_bc_anchor_patched = True
+
+    import os as _os
+
+    import torch.nn.functional as _F
+
+    def _compute_loss_actor(self, observations, observation_features=None, demo_actions=None):
+        actions_pi, log_probs, _ = self.actor(observations, observation_features)
+        q_preds = self.critic_forward(
+            observations=observations,
+            actions=actions_pi,
+            use_target=False,
+            observation_features=observation_features,
+        )
+        min_q_preds = q_preds.min(dim=0)[0]
+        actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
+
+        weight = float(_os.environ.get("HILSERL_ACTOR_BC_ANCHOR_WEIGHT", "0.0"))
+        if weight > 0.0 and demo_actions is not None:
+            bc_loss = _F.mse_loss(actions_pi, demo_actions.to(device=actions_pi.device, dtype=actions_pi.dtype))
+            actor_loss = actor_loss + weight * bc_loss
+        return actor_loss
+
+    SACPolicy.compute_loss_actor = _compute_loss_actor
+
+    orig_forward = SACPolicy.forward
+
+    def _forward(self, batch, model="critic"):
+        if model != "actor" or ACTION not in batch:
+            return orig_forward(self, batch, model=model)
+        raw_action = batch[ACTION]
+        mid = getattr(self, "_anvil_action_mid", None)
+        if mid is not None:
+            half = self._anvil_action_half.to(raw_action.device)
+            demo_actions = (raw_action - mid.to(raw_action.device)) / half
+        else:
+            demo_actions = raw_action  # already (-1,1)-scale (e.g. ee_delta checkpoints)
+        loss_actor = self.compute_loss_actor(
+            observations=batch["state"],
+            observation_features=batch.get("observation_feature"),
+            demo_actions=demo_actions,
+        )
+        return {"loss_actor": loss_actor}
 
     SACPolicy.forward = _forward
 
@@ -1690,6 +1827,7 @@ def apply_all_patches() -> None:
     patch_sac_deterministic_inference()
     patch_sac_loads_action_bounds_on_from_pretrained()
     patch_sac_normalizes_replay_buffer_actions_for_critic_loss()
+    patch_sac_actor_bc_anchor()
     patch_sac_checkpoints_carry_action_bounds()
     patch_sac_freeze_temperature()
     patch_sac_critic_action_embedding()
