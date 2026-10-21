@@ -16,7 +16,7 @@
 #
 # Usage:
 #   ./scripts/run_hilserl_bimanual.sh learner [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--actor-warmup-steps N] [--critic-action-embed-dim N] [--actor-bc-anchor-weight W]
-#   ./scripts/run_hilserl_bimanual.sh actor   [--online-steps N] [--run-name NAME] [--resume] [--critic-action-embed-dim N]
+#   ./scripts/run_hilserl_bimanual.sh actor   [--online-steps N] [--run-name NAME] [--resume] [--critic-action-embed-dim N] [--explore-noise-std S] [--explore-hold-ticks N]
 #   ./scripts/run_hilserl_bimanual.sh stop
 #   ./scripts/run_hilserl_bimanual.sh prune   [--run-name NAME] [--keep N]
 #
@@ -29,6 +29,22 @@
 # disabled the auto-stop safety net once the real step count ran past it
 # -- see the comment at this script's learner branch for the full
 # mechanism).
+#
+# --explore-noise-std S / --explore-hold-ticks N (actor only, default off):
+# adds a small random perturbation to the deployed action, held steady for
+# N ticks (default 15, ~1.5s @ 10Hz) before resampling, via patches.py's
+# patch_sac_actor_held_exploration_noise() (HILSERL_EXPLORE_NOISE_STD/
+# HILSERL_EXPLORE_HOLD_TICKS env vars). Actor-only -- the learner never
+# calls select_action(), only the real-robot rollout does. S is a FRACTION
+# of each action dim's own half-range (e.g. 0.05 = 5%), not an absolute
+# unit. Exists because the BC-anchor fix (--actor-bc-anchor-weight) stopped
+# the actor collapsing but, confirmed on a real 1400-step run, did NOT fix
+# the critic's own near-zero action-sensitivity -- deterministic inference
+# means the critic has literally never seen two different actions tried
+# from the same real state. Deliberately HELD (not fresh per-tick) to
+# avoid reproducing the jitter patch_sac_deterministic_inference() exists
+# to prevent. Off by default, never validated on real hardware yet; try
+# --explore-noise-std 0.05 as a starting point and adjust from there.
 #
 # --actor-warmup-steps N (learner only, default off): hold the actor
 # optimizer's first N steps as critic-only updates after a fresh start or
@@ -100,7 +116,7 @@ set -euo pipefail
 MODE="${1:-}"
 shift || true
 if [[ "$MODE" != "learner" && "$MODE" != "actor" && "$MODE" != "stop" && "$MODE" != "prune" ]]; then
-    echo "Usage: $0 {learner|actor|stop|prune} [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--keep N] [--actor-warmup-steps N] [--critic-action-embed-dim N] [--actor-bc-anchor-weight W]" >&2
+    echo "Usage: $0 {learner|actor|stop|prune} [--online-steps N] [--run-name NAME] [--resume] [--save-freq N] [--keep N] [--actor-warmup-steps N] [--critic-action-embed-dim N] [--actor-bc-anchor-weight W] [--explore-noise-std S] [--explore-hold-ticks N]" >&2
     exit 1
 fi
 
@@ -123,6 +139,8 @@ ACTOR_BC_ANCHOR_WEIGHT=0.0
 # shape-tolerant loader installed (that loader is only wired up when this
 # value is >0), i.e. a hard crash rather than a silent mismatch.
 CRITIC_ACTION_EMBED_DIM=0
+EXPLORE_NOISE_STD=0.0
+EXPLORE_HOLD_TICKS=15
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --online-steps) ONLINE_STEPS="$2"; shift 2 ;;
@@ -133,6 +151,8 @@ while [[ $# -gt 0 ]]; do
         --actor-warmup-steps) ACTOR_WARMUP_STEPS="$2"; shift 2 ;;
         --actor-bc-anchor-weight) ACTOR_BC_ANCHOR_WEIGHT="$2"; shift 2 ;;
         --critic-action-embed-dim) CRITIC_ACTION_EMBED_DIM="$2"; shift 2 ;;
+        --explore-noise-std) EXPLORE_NOISE_STD="$2"; shift 2 ;;
+        --explore-hold-ticks) EXPLORE_HOLD_TICKS="$2"; shift 2 ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -435,10 +455,12 @@ else
         PRETRAINED_ARG="--policy.pretrained_path=/workspace/outputs/learner/checkpoints/last/pretrained_model"
     fi
 
-    echo "[run_hilserl_bimanual] actor -- run_name=$RUN_NAME online_steps=$ONLINE_STEPS resume=$RESUME run_dir=$RUN_DIR"
+    echo "[run_hilserl_bimanual] actor -- run_name=$RUN_NAME online_steps=$ONLINE_STEPS resume=$RESUME explore_noise_std=$EXPLORE_NOISE_STD explore_hold_ticks=$EXPLORE_HOLD_TICKS run_dir=$RUN_DIR"
     echo "[run_hilserl_bimanual] needs a real TTY for keyboard intervention -- running interactively."
     exec docker run -it "${COMMON_ARGS[@]}" \
         -e HILSERL_CRITIC_ACTION_EMBED_DIM="$CRITIC_ACTION_EMBED_DIM" \
+        -e HILSERL_EXPLORE_NOISE_STD="$EXPLORE_NOISE_STD" \
+        -e HILSERL_EXPLORE_HOLD_TICKS="$EXPLORE_HOLD_TICKS" \
         "$IMAGE" \
         bash -c ". /opt/ros/jazzy/setup.sh && . /workspace/install/setup.sh && ros2 run lerobot_control hilserl_actor --config_path=$CONFIG_CONTAINER_PATH --output_dir=/workspace/outputs/$ACTOR_OUTPUT_SUBDIR --policy.online_steps=$ONLINE_STEPS $PRETRAINED_ARG"
 fi

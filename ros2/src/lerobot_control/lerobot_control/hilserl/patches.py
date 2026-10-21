@@ -38,6 +38,18 @@ re-deriving it live during an active debugging session.
       SACPolicy.select_action() resamples fresh stochastic noise every
       10Hz tick -- causes persistent per-tick "creeping" jitter on real
       hardware. Patched to return tanh(mean) (the mode) instead.
+  2026-10-21  patch_sac_actor_held_exploration_noise
+      Even after the BC-anchor fix held (1400 real steps, no collapse),
+      the critic's action-sensitivity ratio was still 0.02-0.065% --
+      unchanged from every measurement all project, because deterministic
+      inference means the critic never sees two different actions tried
+      from the same real state. Loosening temperature doesn't help
+      (confirmed: real execution is already fully deterministic regardless
+      of it). Opt-in (HILSERL_EXPLORE_NOISE_STD/_HOLD_TICKS) HELD random
+      perturbation on the deployed action -- resampled only every N ticks,
+      not freshly every tick, to get real (state, action) diversity into
+      the replay buffer without reproducing the per-tick jitter that
+      patch_sac_deterministic_inference() exists to prevent.
   2026-10-01  patch_sac_loads_action_bounds_on_from_pretrained
       Auto-loads action_bounds.json (joint-space de-normalization) on
       EVERY SACPolicy.from_pretrained() call, not just one entrypoint --
@@ -695,6 +707,122 @@ def patch_sac_deterministic_inference() -> None:
         return actions
 
     SACPolicy.select_action = _select_action_deterministic
+
+
+def patch_sac_actor_held_exploration_noise() -> None:
+    """Follow-up to the 2026-10-21 BC-anchor fix (patch_sac_actor_bc_anchor):
+    that fix stopped the actor's output from collapsing, and a 1400-step
+    real run confirmed it holds -- but the critic's own action-sensitivity
+    ratio (offline Q-variance diagnostic) was STILL 0.024-0.065% on that
+    same run's checkpoints, statistically unchanged from every measurement
+    across this whole project, embedding fix included. The critic still
+    has no real signal to learn dQ/da from.
+
+    First considered and REJECTED: loosening temperature_init back up
+    (patch_sac_freeze_temperature). Doesn't work -- confirmed by reading
+    the actual call graph, not assumed: patch_sac_deterministic_inference()
+    makes select_action() (the ONLY call site used for real-robot
+    stepping) always return torch.tanh(means), completely bypassing
+    temperature/sampling. compute_loss_critic() only ever trains on REAL
+    EXECUTED transitions from the replay buffer -- never on the actor's
+    own internally-sampled rsample() draws (those only feed compute_loss_
+    actor()'s own gradient, a completely different, training-time-only
+    code path). Since real execution is already 100% deterministic
+    regardless of temperature, loosening it creates zero new (state,
+    action) diversity in the data the critic actually learns from. This
+    is why that lever was abandoned in favor of the one below.
+
+    Root cause this DOES address: the critic has literally never seen two
+    different actions tried from the same (or a very similar) real state
+    with different outcomes -- deterministic inference means the SAME
+    state always gets the SAME action, so there is no data from which
+    dQ/da could ever be learned, no matter how much training time passes.
+
+    Fix: add a small, TEMPORALLY-HELD random perturbation to the
+    deployed action -- resampled only every HILSERL_EXPLORE_HOLD_TICKS
+    ticks (held steady in between), not freshly every tick. This is
+    deliberately NOT the naive "just re-enable stochastic sampling"
+    approach already tried and reverted earlier in this project (see
+    patch_sac_deterministic_inference()'s own docstring) -- fresh
+    independent per-tick noise is exactly what produced the original
+    "creeping jitter" hardware complaint, because the existing
+    max_command_step_rad rate limiter only caps the derivative, it can't
+    stop each tick's target from moving toward a NEW random point. A HELD
+    perturbation moves the target to one new point and then holds it
+    there for ~1-2 real seconds (default 15 ticks @ 10Hz) -- smooth,
+    continuous motion within each hold window, a real step change only
+    at window boundaries, which is a qualitatively different (and much
+    less jarring) real-hardware signature than per-tick noise.
+
+    Magnitude is expressed as HILSERL_EXPLORE_NOISE_STD, a FRACTION of
+    each action dimension's own half-range (self._anvil_action_half when
+    action_bounds.json was loaded -- i.e. the joint-space case this task
+    actually uses; falls back to the raw (-1,1)-scale assumption when
+    that attribute is absent, e.g. the original ee_delta checkpoints).
+    Perturbed output is clamped back into [mid-half, mid+half] (or
+    (-1,1)) afterward, so this can never command something outside the
+    checkpoint's own already-established bounds -- and everything
+    downstream (ActionLimiter's per-tick max_command_step_rad clamp in
+    robot_anvil_openarm.py) still applies on top, completely unaffected
+    by this patch, as an independent second safety layer.
+
+    Opt-in via HILSERL_EXPLORE_NOISE_STD (default "0.0" = off, i.e.
+    today's unmodified deterministic behavior) and HILSERL_EXPLORE_HOLD_
+    TICKS (default "15", only read when the former is nonzero). Actor-
+    only -- the learner never calls select_action() (only the real-robot
+    rollout does; the learner's training path goes through
+    compute_loss_actor()/compute_loss_critic() directly), so this has no
+    learner-side CLI wiring, unlike --actor-warmup-steps/--actor-bc-
+    anchor-weight. Discrete actions (config.num_discrete_actions is not
+    None) are left untouched -- continuous Gaussian noise on a discrete
+    action slot would be meaningless; not relevant to this task today
+    (num_discrete_actions is None) but guarded regardless. MUST be
+    registered after patch_sac_deterministic_inference() (above) so the
+    `orig_select_action` this captures is already the deterministic
+    tanh(mean) version, not the raw rsample() original.
+    """
+    from lerobot.policies.sac.modeling_sac import SACPolicy
+
+    if getattr(SACPolicy, "_anvil_explore_noise_patched", False):
+        return
+    SACPolicy._anvil_explore_noise_patched = True
+
+    import os as _os
+
+    import torch as _torch
+
+    orig_select_action = SACPolicy.select_action
+
+    @_torch.no_grad()
+    def _select_action_with_exploration(self, batch):
+        action = orig_select_action(self, batch)
+        if self.config.num_discrete_actions is not None:
+            return action
+
+        std_frac = float(_os.environ.get("HILSERL_EXPLORE_NOISE_STD", "0.0"))
+        if std_frac <= 0.0:
+            return action
+        hold_ticks = int(_os.environ.get("HILSERL_EXPLORE_HOLD_TICKS", "15"))
+
+        half = getattr(self, "_anvil_action_half", None)
+        mid = getattr(self, "_anvil_action_mid", None)
+        if half is not None:
+            scale = half.to(action.device)
+            low, high = (mid.to(action.device) - scale), (mid.to(action.device) + scale)
+        else:
+            scale, low, high = 1.0, -1.0, 1.0
+
+        perturbation = getattr(self, "_anvil_explore_perturbation", None)
+        ticks_left = getattr(self, "_anvil_explore_ticks_left", 0)
+        if perturbation is None or perturbation.shape != action.shape or ticks_left <= 0:
+            perturbation = _torch.randn_like(action) * std_frac * scale
+            self._anvil_explore_perturbation = perturbation
+            ticks_left = hold_ticks
+        self._anvil_explore_ticks_left = ticks_left - 1
+
+        return (action + self._anvil_explore_perturbation).clamp(low, high)
+
+    SACPolicy.select_action = _select_action_with_exploration
 
 
 def patch_sac_loads_action_bounds_on_from_pretrained() -> None:
@@ -1825,6 +1953,7 @@ def apply_all_patches() -> None:
     patch_learner_resume_reloads_trained_weights()
     patch_learner_pauses_training_when_actor_idle()
     patch_sac_deterministic_inference()
+    patch_sac_actor_held_exploration_noise()
     patch_sac_loads_action_bounds_on_from_pretrained()
     patch_sac_normalizes_replay_buffer_actions_for_critic_loss()
     patch_sac_actor_bc_anchor()
