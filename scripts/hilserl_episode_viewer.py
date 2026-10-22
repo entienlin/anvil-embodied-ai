@@ -15,6 +15,22 @@ Does NOT require torch, ROS2, or lerobot.
 
 Usage:
     python3 scripts/hilserl_episode_viewer.py ep1.npz [ep2.npz ...] -o output.html
+
+Design note (CLI vs. server): this module is deliberately kept as the single
+source of truth for loading episodes and rendering the viewer HTML/JS/CSS
+(load_episode, compute_fk_positions, render_skeleton_frames, build_html,
+render_episode_html, encode_frame_data_uri, ...). The CLI entry point below
+(main()) is one thin consumer of those functions, writing a static
+self-contained .html file for one-off/offline use. A second consumer,
+scripts/hilserl_episode_viewer_server.py, imports this module and calls the
+exact same functions to serve the same viewer markup dynamically for an
+arbitrary episode picked from a dropdown, with an in-memory LRU cache instead
+of writing a file. Both stay in sync by construction -- there is no
+duplicated rendering logic to drift between the two. The CLI mode is kept
+working (not replaced) because it's still the simplest path for a true
+one-off "give me a single static HTML to send/open later" use case; the
+server is the better choice for anything involving comparing/browsing
+multiple runs/episodes without regenerating files by hand.
 """
 
 from __future__ import annotations
@@ -78,6 +94,21 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_URDF_PATH = os.path.join(
     _REPO_ROOT, "configs", "hilserl", "urdf", "openarm_teleop_kinematics.urdf"
 )
+
+# --------------------------------------------------------------------------
+# real control frequency, for the playback-speed control
+# --------------------------------------------------------------------------
+#
+# Confirmed directly from this task's own configs (not assumed):
+#   configs/hilserl/env_push_bottle_bimanual_jointspace.yaml:41   fps: 10
+#   configs/hilserl/env_push_bottle_bimanual_jointspace.yaml:79,92  control_frequency: 10.0
+#   configs/hilserl/train_rl_push_bottle_bimanual_jointspace.yaml:94  fps: 10
+#   configs/hilserl/train_rl_push_bottle_bimanual_jointspace.yaml:132,158  control_frequency: 10.0
+# i.e. one saved (state_deg/action/...) step IS one real 100ms control tick.
+# "1x / real-time" playback therefore means 100ms between frames, not the
+# previously-hardcoded 90ms (~11.1 Hz, ~1.11x real speed) the player used.
+CONTROL_FREQUENCY_HZ = 10.0
+REAL_FRAME_INTERVAL_MS = 1000.0 / CONTROL_FREQUENCY_HZ  # 100.0
 
 
 def _try_import_placo():
@@ -350,6 +381,10 @@ h1 { font-size: 18px; margin: 0 0 12px 0; }
   padding: 4px 10px; cursor: pointer; font-size: 12px;
 }
 .controls button:hover { background: #343945; }
+.controls select {
+  background: #2a2e38; color: #e7e9ee; border: 1px solid #3a3f4b; border-radius: 4px;
+  padding: 3px 6px; cursor: pointer; font-size: 12px;
+}
 .controls input[type=range] { flex: 1 1 auto; min-width: 120px; }
 .frame-label { font-size: 12px; color: #9aa3b2; white-space: nowrap; min-width: 86px; text-align: right; }
 .cams { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -472,6 +507,7 @@ function setupEpisode(epId) {
   const playBtn = document.getElementById("play-" + epId);
   const prevBtn = document.getElementById("prev-" + epId);
   const nextBtn = document.getElementById("next-" + epId);
+  const speedSelect = document.getElementById("speed-" + epId);
   const readout = document.getElementById("readout-" + epId);
   const camImgs = {};
   data.camera_names.forEach(cam => {
@@ -537,6 +573,32 @@ function setupEpisode(epId) {
     playBtn.textContent = "Play";
   }
 
+  // Playback speed: REAL_FRAME_INTERVAL_MS is the true real-world control
+  // tick (100ms @ 10Hz for this task, see Python REAL_FRAME_INTERVAL_MS /
+  // CONTROL_FREQUENCY_HZ). "speed" is a multiplier on top of that real
+  // interval -- 1x reproduces real-time playback exactly, 2x/4x speed it
+  // up, 0.25x/0.5x slow it down. The previous player had no speed control
+  // at all and a hardcoded 90ms tick (~1.11x real speed), kept below as an
+  // explicit option so old recordings/behavior can still be reproduced.
+  const REAL_FRAME_INTERVAL_MS = window.__realFrameIntervalMs || 100;
+
+  function currentIntervalMs() {
+    const speed = speedSelect ? parseFloat(speedSelect.value) : 1;
+    return REAL_FRAME_INTERVAL_MS / (speed > 0 ? speed : 1);
+  }
+
+  function tick() {
+    frameIdx += 1;
+    if (frameIdx >= n) { stopPlay(); frameIdx = n - 1; render(); return; }
+    render();
+  }
+
+  function restartTimerIfPlaying() {
+    if (!playing) return;
+    if (timer) clearInterval(timer);
+    timer = setInterval(tick, currentIntervalMs());
+  }
+
   slider.addEventListener("input", () => { stopPlay(); frameIdx = parseInt(slider.value, 10); render(); });
   prevBtn.addEventListener("click", () => { stopPlay(); frameIdx = Math.max(0, frameIdx - 1); render(); });
   nextBtn.addEventListener("click", () => { stopPlay(); frameIdx = Math.min(n - 1, frameIdx + 1); render(); });
@@ -544,12 +606,11 @@ function setupEpisode(epId) {
     if (playing) { stopPlay(); return; }
     playing = true;
     playBtn.textContent = "Pause";
-    timer = setInterval(() => {
-      frameIdx += 1;
-      if (frameIdx >= n) { stopPlay(); frameIdx = n - 1; render(); return; }
-      render();
-    }, 90);
+    timer = setInterval(tick, currentIntervalMs());
   });
+  if (speedSelect) {
+    speedSelect.addEventListener("change", restartTimerIfPlaying);
+  }
 
   render();
 }
@@ -657,6 +718,14 @@ def render_episode_html(
         <button id="next-{ep_id}">next &raquo;</button>
         <input type="range" id="slider-{ep_id}" min="0" max="{max(n - 1, 0)}" value="0" step="1">
         <span class="frame-label" id="framelabel-{ep_id}">Frame 0 / {max(n - 1, 0)}</span>
+        <select id="speed-{ep_id}" title="Playback speed (1x = real time, {CONTROL_FREQUENCY_HZ:g}Hz = {REAL_FRAME_INTERVAL_MS:g}ms/frame)">
+          <option value="0.25">0.25x</option>
+          <option value="0.5">0.5x</option>
+          <option value="1" selected>1x (real-time, {CONTROL_FREQUENCY_HZ:g} Hz)</option>
+          <option value="1.1111">old default (~11.1 Hz)</option>
+          <option value="2">2x</option>
+          <option value="4">4x</option>
+        </select>
       </div>
       <div class="readout" id="readout-{ep_id}"></div>
       <div class="cams">{cam_html}</div>
@@ -710,6 +779,7 @@ def build_html(
 {"".join(data_scripts)}
 <script>
 window.__episodeIds = {ep_ids_json};
+window.__realFrameIntervalMs = {REAL_FRAME_INTERVAL_MS!r};  // 1x/real-time, from CONTROL_FREQUENCY_HZ={CONTROL_FREQUENCY_HZ!r}
 {JS}
 </script>
 </body>
